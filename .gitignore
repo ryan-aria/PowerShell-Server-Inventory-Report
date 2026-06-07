@@ -1,0 +1,23 @@
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+*.code-workspace
+
+# PowerShell
+*.log
+
+# Generated reports
+reports/*
+!reports/.gitkeep
+
+# Screenshots
+screenshots/*
+!screenshots/.gitkeep
+!screenshots/*.png
