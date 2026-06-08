@@ -5,11 +5,12 @@
     Generates a multi-server inventory report and exports results to CSV, HTML, and JSON.
 
 .DESCRIPTION
-    PowerShell Server Inventory Report v1.4
+    PowerShell Server Inventory Report v1.5
     Reads server names from servers.txt and collects system, hardware, BIOS,
-    CPU, uptime, disk, and Windows service information from each target using
-    CIM/WMI. Exports a combined inventory report to CSV, a dashboard-style HTML
-    report, and a JSON report for InfraOps Dashboard integration.
+    CPU, uptime, disk, Windows service, and installed software information
+    from each target using CIM/WMI and registry queries. Exports a combined
+    inventory report to CSV, a dashboard-style HTML report, and a JSON report
+    for InfraOps Dashboard integration.
 
 .PARAMETER OutputPath
     Directory where InventoryReport.csv, InventoryReport.html, and InventoryReport.json will be saved.
@@ -29,19 +30,45 @@
 .EXAMPLE
     .\ServerInventoryReport.ps1 -ServerListFile '.\my-servers.txt'
     Uses a custom server list file.
+
+.EXAMPLE
+    .\ServerInventoryReport.ps1 -SoftwareFilter 'VMware'
+    Filters software results in CSV, HTML, and JSON exports to VMware-related entries.
+
+.PARAMETER SoftwareFilter
+    Optional filter applied to exported software results. Matches display name or publisher.
+    Inventory collection still runs for all software; filtering applies to exports only.
 #>
 
 [CmdletBinding()]
 param(
     [string]$OutputPath,
-    [string]$ServerListFile
+    [string]$ServerListFile,
+    [string]$SoftwareFilter
 )
 
 # Variables
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion    = 'v1.4'
+$ScriptVersion    = 'v1.5'
 $ReportScriptName = 'ServerInventoryReport.ps1'
+
+$SoftwareRegistryPaths = @(
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+
+$RemoteSoftwareRegistryPaths = @(
+    'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+)
+
+$SoftwareNoisePatterns = @(
+    'Security Update'
+    'Update for Microsoft'
+    'Hotfix'
+    'Language Pack'
+)
 
 $MonitoredServices = @(
     'WinRM'
@@ -272,6 +299,275 @@ function Get-RemoteDiskInventory {
         }
 }
 
+function Format-SoftwareInstallDate {
+    param(
+        [string]$InstallDate
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InstallDate)) {
+        return ''
+    }
+
+    if ($InstallDate -match '^\d{8}$') {
+        return '{0}-{1}-{2}' -f $InstallDate.Substring(0, 4), $InstallDate.Substring(4, 2), $InstallDate.Substring(6, 2)
+    }
+
+    return $InstallDate
+}
+
+function Test-NoisySoftwareEntry {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DisplayName
+    )
+
+    foreach ($Pattern in $SoftwareNoisePatterns) {
+        if ($DisplayName -like "*$Pattern*") {
+            return $true
+        }
+    }
+
+    if ($DisplayName -match '\bKB\d+') {
+        return $true
+    }
+
+    return $false
+}
+
+function Get-CleanSoftwareInventory {
+    <#
+    .SYNOPSIS
+        Returns meaningful installed applications by excluding noisy registry entries.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [array]$Software
+    )
+
+    return @($Software | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_.DisplayName) -and
+            -not (Test-NoisySoftwareEntry -DisplayName $_.DisplayName)
+        })
+}
+
+function Get-FilteredSoftwareInventory {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Software,
+
+        [string]$Filter
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Filter)) {
+        return $Software
+    }
+
+    return @($Software | Where-Object {
+            $_.DisplayName -like "*$Filter*" -or
+            ($_.Publisher -and $_.Publisher -like "*$Filter*")
+        })
+}
+
+function Get-SoftwareSummary {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Software
+    )
+
+    $TopPublishers = $Software |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_.Publisher) } |
+        Group-Object Publisher |
+        Sort-Object Count -Descending |
+        Select-Object -First 10 @{Name = 'Publisher'; Expression = { $_.Name } }, Count
+
+    return [PSCustomObject]@{
+        TotalSoftwarePackages = $Software.Count
+        TopPublisher          = ($TopPublishers | Select-Object -First 1).Publisher
+        TopPublishers         = $TopPublishers
+    }
+}
+
+function Get-RegistryStringValueRemote {
+    param(
+        [Parameter(Mandatory)]
+        $CimSession,
+
+        [Parameter(Mandatory)]
+        [uint32]$Hive,
+
+        [Parameter(Mandatory)]
+        [string]$KeyPath,
+
+        [Parameter(Mandatory)]
+        [string]$ValueName
+    )
+
+    $Result = Invoke-CimMethod -CimSession $CimSession -Namespace root/default -ClassName StdRegProv -MethodName GetStringValue -Arguments @{
+        hDefKey     = $Hive
+        sSubKeyName = $KeyPath
+        sValueName  = $ValueName
+    } -ErrorAction SilentlyContinue
+
+    if ($Result -and $Result.ReturnValue -eq 0) {
+        return $Result.sValue
+    }
+
+    return ''
+}
+
+function Get-RegistryDwordValueRemote {
+    param(
+        [Parameter(Mandatory)]
+        $CimSession,
+
+        [Parameter(Mandatory)]
+        [uint32]$Hive,
+
+        [Parameter(Mandatory)]
+        [string]$KeyPath,
+
+        [Parameter(Mandatory)]
+        [string]$ValueName
+    )
+
+    $Result = Invoke-CimMethod -CimSession $CimSession -Namespace root/default -ClassName StdRegProv -MethodName GetDWORDValue -Arguments @{
+        hDefKey     = $Hive
+        sSubKeyName = $KeyPath
+        sValueName  = $ValueName
+    } -ErrorAction SilentlyContinue
+
+    if ($Result -and $Result.ReturnValue -eq 0) {
+        return [uint32]$Result.uValue
+    }
+
+    return $null
+}
+
+function Get-LocalSoftwareFromRegistry {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName
+    )
+
+    $Software = foreach ($Path in $SoftwareRegistryPaths) {
+        Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_.DisplayName) } |
+            ForEach-Object {
+                $EstimatedSizeMB = if ($_.EstimatedSize) {
+                    [math]::Round($_.EstimatedSize / 1024, 2)
+                }
+                else {
+                    0
+                }
+
+                [PSCustomObject]@{
+                    ComputerName    = $ComputerName
+                    DisplayName     = $_.DisplayName
+                    DisplayVersion  = $_.DisplayVersion
+                    Publisher       = $_.Publisher
+                    InstallDate     = Format-SoftwareInstallDate -InstallDate ([string]$_.InstallDate)
+                    EstimatedSizeMB = $EstimatedSizeMB
+                }
+            }
+    }
+
+    return @($Software)
+}
+
+function Get-RemoteSoftwareFromRegistry {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ServerName,
+
+        [Parameter(Mandatory)]
+        [string]$ComputerName
+    )
+
+    $Hive      = [uint32]2147483650
+    $Software  = @()
+    $CimSession = $null
+
+    try {
+        $CimSession = New-CimSession -ComputerName $ServerName -ErrorAction Stop
+
+        foreach ($RegPath in $RemoteSoftwareRegistryPaths) {
+            $EnumResult = Invoke-CimMethod -CimSession $CimSession -Namespace root/default -ClassName StdRegProv -MethodName EnumKey -Arguments @{
+                hDefKey     = $Hive
+                sSubKeyName = $RegPath
+            } -ErrorAction SilentlyContinue
+
+            if (-not $EnumResult -or $EnumResult.ReturnValue -ne 0 -or -not $EnumResult.sNames) {
+                continue
+            }
+
+            foreach ($SubKey in $EnumResult.sNames) {
+                $KeyPath = "$RegPath\$SubKey"
+                $DisplayName = Get-RegistryStringValueRemote -CimSession $CimSession -Hive $Hive -KeyPath $KeyPath -ValueName 'DisplayName'
+
+                if ([string]::IsNullOrWhiteSpace($DisplayName)) {
+                    continue
+                }
+
+                $EstimatedSize = Get-RegistryDwordValueRemote -CimSession $CimSession -Hive $Hive -KeyPath $KeyPath -ValueName 'EstimatedSize'
+                $EstimatedSizeMB = if ($EstimatedSize) {
+                    [math]::Round($EstimatedSize / 1024, 2)
+                }
+                else {
+                    0
+                }
+
+                $Software += [PSCustomObject]@{
+                    ComputerName    = $ComputerName
+                    DisplayName     = $DisplayName
+                    DisplayVersion  = Get-RegistryStringValueRemote -CimSession $CimSession -Hive $Hive -KeyPath $KeyPath -ValueName 'DisplayVersion'
+                    Publisher       = Get-RegistryStringValueRemote -CimSession $CimSession -Hive $Hive -KeyPath $KeyPath -ValueName 'Publisher'
+                    InstallDate     = Format-SoftwareInstallDate -InstallDate (Get-RegistryStringValueRemote -CimSession $CimSession -Hive $Hive -KeyPath $KeyPath -ValueName 'InstallDate')
+                    EstimatedSizeMB = $EstimatedSizeMB
+                }
+            }
+        }
+    }
+    finally {
+        if ($CimSession) {
+            Remove-CimSession -CimSession $CimSession -ErrorAction SilentlyContinue
+        }
+    }
+
+    return $Software
+}
+
+function Get-SoftwareInventory {
+    <#
+    .SYNOPSIS
+        Collects installed software inventory from registry paths.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ServerName,
+
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory)]
+        [bool]$IsLocal
+    )
+
+    try {
+        if ($IsLocal) {
+            $RawSoftware = Get-LocalSoftwareFromRegistry -ComputerName $ComputerName
+        }
+        else {
+            $RawSoftware = Get-RemoteSoftwareFromRegistry -ServerName $ServerName -ComputerName $ComputerName
+        }
+
+        return @(Get-CleanSoftwareInventory -Software $RawSoftware)
+    }
+    catch {
+        Write-Verbose "Unable to collect software inventory for '$ServerName': $($_.Exception.Message)"
+        return @()
+    }
+}
+
 function Get-ServiceInventory {
     <#
     .SYNOPSIS
@@ -419,6 +715,11 @@ function Get-ServerInventory {
             -IsLocal $IsLocal `
             -ServiceNames $MonitoredServices)
 
+        $SoftwareInventory = @(Get-SoftwareInventory `
+            -ServerName $ServerName `
+            -ComputerName $SystemInventory.ComputerName `
+            -IsLocal $IsLocal)
+
         $SystemInventory.ServerStatus = Get-CombinedServerHealthStatus `
             -DiskStatuses @($DiskInventory.Status) `
             -ServiceHealthStatuses @($ServiceInventory.HealthStatus)
@@ -427,6 +728,7 @@ function Get-ServerInventory {
             System   = $SystemInventory
             Disks    = $DiskInventory
             Services = $ServiceInventory
+            Software = $SoftwareInventory
         }
     }
     catch {
@@ -451,6 +753,7 @@ function Get-ServerInventory {
             }
             Disks    = @()
             Services = @()
+            Software = @()
         }
     }
 }
@@ -592,6 +895,48 @@ function Get-HtmlServiceDetailsTable {
 "@
 }
 
+function Get-HtmlSoftwareDetailsTable {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Software
+    )
+
+    if (-not $Software) {
+        return '<p class="no-data">No software information available.</p>'
+    }
+
+    $HtmlRows = foreach ($App in $Software) {
+        @"
+        <tr>
+            <td>$($App.ComputerName)</td>
+            <td>$($App.DisplayName)</td>
+            <td>$($App.DisplayVersion)</td>
+            <td>$($App.Publisher)</td>
+            <td>$($App.InstallDate)</td>
+        </tr>
+"@
+    }
+
+    return @"
+<div class="software-table-wrapper">
+<table class="data-table software-table">
+    <thead>
+        <tr>
+            <th>Computer</th>
+            <th>Display Name</th>
+            <th>Version</th>
+            <th>Publisher</th>
+            <th>Install Date</th>
+        </tr>
+    </thead>
+    <tbody>
+        $($HtmlRows -join "`n")
+    </tbody>
+</table>
+</div>
+"@
+}
+
 function Export-InventoryJson {
     <#
     .SYNOPSIS
@@ -617,7 +962,10 @@ function Export-InventoryJson {
         [array]$Disks,
 
         [Parameter(Mandatory)]
-        [array]$Services
+        [array]$Services,
+
+        [Parameter(Mandatory)]
+        [array]$Software
     )
 
     $ReachableServers = @($Servers | Where-Object { $_.Reachable })
@@ -640,7 +988,8 @@ function Export-InventoryJson {
             totalServices    = $Summary.TotalServices
             healthyServices  = $Summary.HealthyServices
             warningServices  = $Summary.WarningServices
-            criticalServices = $Summary.CriticalServices
+            criticalServices      = $Summary.CriticalServices
+            totalSoftwarePackages = $Summary.TotalSoftwarePackages
         }
         servers = @(
             foreach ($Server in $ReachableServers) {
@@ -681,6 +1030,18 @@ function Export-InventoryJson {
                     status       = $Service.Status
                     startType    = $Service.StartType
                     healthStatus = $Service.HealthStatus
+                }
+            }
+        )
+        software = @(
+            foreach ($App in $Software) {
+                [ordered]@{
+                    computerName    = $App.ComputerName
+                    displayName     = $App.DisplayName
+                    displayVersion  = $App.DisplayVersion
+                    publisher       = $App.Publisher
+                    installDate     = $App.InstallDate
+                    estimatedSizeMB = [double]$App.EstimatedSizeMB
                 }
             }
         )
@@ -900,6 +1261,17 @@ function Get-HtmlStyles {
         .footer p {
             margin: 4px 0;
         }
+        .software-table-wrapper {
+            max-height: 500px;
+            overflow-y: auto;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+        }
+        .software-table thead th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
 '@
 }
 
@@ -923,6 +1295,10 @@ $InventoryResults = foreach ($ServerName in $ServerNames) {
 $AllServers  = @($InventoryResults | ForEach-Object { $_.System })
 $AllDisks    = @($InventoryResults | ForEach-Object { $_.Disks })
 $AllServices = @($InventoryResults | ForEach-Object { $_.Services })
+$AllSoftware = @($InventoryResults | ForEach-Object { $_.Software })
+
+$ExportSoftware = @(Get-FilteredSoftwareInventory -Software $AllSoftware -Filter $SoftwareFilter)
+$SoftwareSummary = Get-SoftwareSummary -Software $ExportSoftware
 
 # Dashboard Summary
 
@@ -939,7 +1315,9 @@ $ServerSummary = [PSCustomObject]@{
     TotalServices    = $AllServices.Count
     HealthyServices  = @($AllServices | Where-Object HealthStatus -eq 'Healthy').Count
     WarningServices  = @($AllServices | Where-Object HealthStatus -eq 'Warning').Count
-    CriticalServices = @($AllServices | Where-Object HealthStatus -eq 'Critical').Count
+    CriticalServices      = @($AllServices | Where-Object HealthStatus -eq 'Critical').Count
+    TotalSoftwarePackages = $SoftwareSummary.TotalSoftwarePackages
+    TopSoftwarePublisher  = $SoftwareSummary.TopPublisher
 }
 
 # Export Reports
@@ -964,6 +1342,10 @@ try {
             SystemUptime    = $Server.SystemUptime
             ServiceName     = ''
             DisplayName     = ''
+            DisplayVersion  = ''
+            Publisher       = ''
+            InstallDate     = ''
+            EstimatedSizeMB = ''
             ServiceStatus   = ''
             StartType       = ''
             DriveLetter     = ''
@@ -992,6 +1374,10 @@ try {
             SystemUptime    = ''
             ServiceName     = ''
             DisplayName     = ''
+            DisplayVersion  = ''
+            Publisher       = ''
+            InstallDate     = ''
+            EstimatedSizeMB = ''
             ServiceStatus   = ''
             StartType       = ''
             DriveLetter     = $Disk.DriveLetter
@@ -1020,6 +1406,10 @@ try {
             SystemUptime    = ''
             ServiceName     = $Service.ServiceName
             DisplayName     = $Service.DisplayName
+            DisplayVersion  = ''
+            Publisher       = ''
+            InstallDate     = ''
+            EstimatedSizeMB = ''
             ServiceStatus   = $Service.Status
             StartType       = $Service.StartType
             DriveLetter     = ''
@@ -1031,6 +1421,38 @@ try {
         }
     }
 
+    foreach ($App in $ExportSoftware) {
+        $CsvExport += [PSCustomObject]@{
+            RecordType      = 'Software'
+            ServerName      = $App.ComputerName
+            ComputerName    = $App.ComputerName
+            OperatingSystem = ''
+            OSVersion       = ''
+            Manufacturer    = ''
+            Model           = ''
+            TotalRAMGB      = ''
+            FreeRAMGB       = ''
+            BIOSVersion     = ''
+            SerialNumber    = ''
+            CPUName         = ''
+            SystemUptime    = ''
+            ServiceName     = ''
+            DisplayName     = $App.DisplayName
+            DisplayVersion  = $App.DisplayVersion
+            Publisher       = $App.Publisher
+            InstallDate     = $App.InstallDate
+            EstimatedSizeMB = $App.EstimatedSizeMB
+            ServiceStatus   = ''
+            StartType       = ''
+            DriveLetter     = ''
+            TotalSizeGB     = ''
+            FreeSpaceGB     = ''
+            FreePercent     = ''
+            Status          = ''
+            HealthStatus    = ''
+        }
+    }
+
     $CsvExport | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
 
     # HTML Report
@@ -1038,9 +1460,11 @@ try {
     $ReportDate      = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $ReportDateShort = Get-Date -Format 'yyyy-MM-dd'
     $CurrentUser     = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $ServerHtml  = Get-HtmlServerStatusTable -Servers $AllServers
-    $DiskHtml    = Get-HtmlDiskDetailsTable -Disks $AllDisks
-    $ServiceHtml = Get-HtmlServiceDetailsTable -Services $AllServices
+    $ServerHtml   = Get-HtmlServerStatusTable -Servers $AllServers
+    $DiskHtml     = Get-HtmlDiskDetailsTable -Disks $AllDisks
+    $ServiceHtml  = Get-HtmlServiceDetailsTable -Services $AllServices
+    $SoftwareHtml = Get-HtmlSoftwareDetailsTable -Software $ExportSoftware
+    $TopPublisherDisplay = if ($ServerSummary.TopSoftwarePublisher) { $ServerSummary.TopSoftwarePublisher } else { 'N/A' }
 
     $HtmlReport = @"
 <!DOCTYPE html>
@@ -1126,7 +1550,25 @@ $(Get-HtmlStyles)
         <h2>Service Inventory</h2>
         $ServiceHtml
 
+        <div class="summary-panel">
+            <h2>Software Inventory Summary</h2>
+            <div class="summary-grid">
+                <div class="summary-card">
+                    <div class="label">Total Software Packages</div>
+                    <div class="value">$($ServerSummary.TotalSoftwarePackages)</div>
+                </div>
+                <div class="summary-card">
+                    <div class="label">Top Publisher</div>
+                    <div class="value" style="font-size: 1rem;">$TopPublisherDisplay</div>
+                </div>
+            </div>
+        </div>
+
+        <h2>Software Inventory</h2>
+        $SoftwareHtml
+
         <div class="footer">
+            <p>PowerShell Server Inventory Report $ScriptVersion</p>
             <p><strong>Generated By:</strong> $ReportScriptName</p>
             <p><strong>Current User:</strong> $CurrentUser</p>
             <p><strong>Report Version:</strong> $ScriptVersion</p>
@@ -1147,7 +1589,8 @@ $(Get-HtmlStyles)
         -Summary $ServerSummary `
         -Servers $AllServers `
         -Disks $AllDisks `
-        -Services $AllServices
+        -Services $AllServices `
+        -Software $ExportSoftware
 }
 catch {
     Write-Error "Unable to export inventory reports. $_"
@@ -1176,6 +1619,29 @@ if ($CriticalServices) {
     Write-Host 'Critical Services Detected'
     Write-Host '----------------------------'
     Write-ServiceConsoleTable -Services $CriticalServices
+    Write-Host ''
+}
+
+Write-Host 'Software Summary'
+Write-Host '----------------'
+Write-Host "Total Software Packages : $($SoftwareSummary.TotalSoftwarePackages)"
+Write-Host ''
+Write-Host 'Top Publishers'
+Write-Host ''
+if ($SoftwareSummary.TopPublishers) {
+    $SoftwareSummary.TopPublishers |
+        Select-Object Publisher, Count |
+        Format-Table -AutoSize |
+        Out-String -Width 200 |
+        ForEach-Object { Write-Host $_ }
+}
+else {
+    Write-Host 'No publisher data available.'
+    Write-Host ''
+}
+
+if ($SoftwareFilter) {
+    Write-Host "Software Filter Applied : $SoftwareFilter"
     Write-Host ''
 }
 

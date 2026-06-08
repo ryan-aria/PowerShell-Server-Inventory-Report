@@ -1,12 +1,12 @@
 # PowerShell Server Inventory Report
 
-A production-style PowerShell inventory reporting tool that collects system, disk, and Windows service information from multiple servers and exports results to CSV, HTML, and JSON.
+A production-style PowerShell inventory reporting tool that collects system, disk, Windows service, and installed software information from multiple servers and exports results to CSV, HTML, and JSON.
 
 ## Overview
 
 **PowerShell Server Inventory Report** is designed for System Administrators who need a quick, repeatable way to document server hardware, operating system details, and disk usage across one or many systems. The script uses CIM/WMI for remote collection, evaluates server and disk health, and exports professional reports suitable for audits, change records, and portfolio demonstrations.
 
-**Current Version: v1.4**
+**Current Version: v1.5**
 
 ## Features
 
@@ -55,15 +55,26 @@ A production-style PowerShell inventory reporting tool that collects system, dis
 - **Service JSON Export** — `services` array in `InventoryReport.json`
 - **Service CSV Export** — `RecordType: Service` rows in `InventoryReport.csv`
 
+### Installed Software Inventory (v1.5)
+
+- **Installed Software Inventory** — Collects applications from Windows uninstall registry keys
+- **Software Asset Reporting** — Publisher summary and package counts per server
+- **Publisher Summary** — Top publishers displayed in console and HTML dashboard
+- **Software Inventory Dashboard** — Scrollable HTML table for large software inventories
+- **Software JSON Export** — `software` array in `InventoryReport.json`
+- **Software CSV Export** — `RecordType: Software` rows in `InventoryReport.csv`
+- **Software Filtering** — Optional `-SoftwareFilter` parameter for CSV, HTML, and JSON exports
+
 ## Architecture
 
-The collector gathers three inventory layers per server:
+The collector gathers four inventory layers per server:
 
 | Layer | Data Collected |
 |-------|----------------|
 | **Servers** | OS, hardware, BIOS, CPU, RAM, uptime, server health status |
 | **Disks** | Drive letter, size, free space, free percent, disk health status |
 | **Services** | Service name, display name, status, start type, service health status |
+| **Software** | Display name, version, publisher, install date, estimated size |
 
 ### Export Formats
 
@@ -152,7 +163,19 @@ Server status uses the most severe result from disks and services:
    ```powershell
    .\ServerInventoryReport.ps1 -OutputPath 'C:\Reports'
    .\ServerInventoryReport.ps1 -ServerListFile '.\my-servers.txt'
+   .\ServerInventoryReport.ps1 -SoftwareFilter 'VMware'
    ```
+
+### Software Filtering
+
+Use `-SoftwareFilter` to limit exported software in CSV, HTML, and JSON:
+
+```powershell
+.\ServerInventoryReport.ps1 -SoftwareFilter "Google"
+.\ServerInventoryReport.ps1 -SoftwareFilter "VMware"
+```
+
+Inventory collection still runs for all software; the filter applies to export output only.
 
 6. Open the generated files:
 
@@ -210,15 +233,15 @@ JSON report saved to: .\reports\InventoryReport.json
 
 | File | Description |
 |------|-------------|
-| `InventoryReport.csv` | All server, disk, and service records (RecordType: Server / Disk / Service) |
-| `InventoryReport.html` | Multi-server dashboard with server, disk, and service health sections |
+| `InventoryReport.csv` | All server, disk, service, and software records (RecordType: Server / Disk / Service / Software) |
+| `InventoryReport.html` | Multi-server dashboard with server, disk, service, and software sections |
 | `InventoryReport.json` | Structured JSON for InfraOps Dashboard and automation integration |
 
 ### JSON Structure
 
 ```json
 {
-  "reportVersion": "v1.4",
+  "reportVersion": "v1.5",
   "generatedAt": "2026-06-07T19:30:00",
   "generatedBy": "ServerInventoryReport.ps1",
   "serverSummary": {
@@ -234,7 +257,8 @@ JSON report saved to: .\reports\InventoryReport.json
     "totalServices": 11,
     "healthyServices": 9,
     "warningServices": 2,
-    "criticalServices": 1
+    "criticalServices": 1,
+    "totalSoftwarePackages": 124
   },
   "servers": [
     {
@@ -264,6 +288,16 @@ JSON report saved to: .\reports\InventoryReport.json
       "healthStatus": "Critical"
     }
   ],
+  "software": [
+    {
+      "computerName": "DRAGON",
+      "displayName": "Google Chrome",
+      "displayVersion": "137.0.7151.120",
+      "publisher": "Google LLC",
+      "installDate": "2026-05-10",
+      "estimatedSizeMB": 412
+    }
+  ],
   "failedServers": []
 }
 ```
@@ -280,6 +314,7 @@ Add screenshots of the HTML report to the `screenshots` folder for documentation
 - WMI / CIM (`Get-CimInstance`)
 - Storage cmdlets (`Get-Volume` for local disks)
 - Service cmdlets (`Get-Service`, `Win32_Service` via CIM)
+- Windows Registry (`Get-ItemProperty`, `StdRegProv` via CIM for remote)
 - `Export-Csv`, `ConvertTo-Json`, and custom HTML generation
 
 ## Version History
@@ -291,6 +326,7 @@ Add screenshots of the HTML report to the `screenshots` folder for documentation
 | **v1.2** | Multi-server inventory — remote collection, server health evaluation, unreachable handling |
 | **v1.3** | JSON export — InfraOps Dashboard integration, machine-readable collector output |
 | **v1.4** | Windows services inventory — service health monitoring, critical service detection, service exports |
+| **v1.5** | Installed software inventory — software asset reporting, publisher summary, software filtering |
 
 ## Future Enhancements
 
