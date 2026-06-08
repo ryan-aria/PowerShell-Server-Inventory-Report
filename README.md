@@ -6,7 +6,11 @@ A production-style PowerShell inventory reporting tool that collects system and 
 
 **PowerShell Server Inventory Report** is designed for System Administrators who need a quick, repeatable way to document server hardware, operating system details, and disk usage. The script uses CIM/WMI and native PowerShell cmdlets, then exports professional reports suitable for audits, change records, and portfolio demonstrations.
 
+**Current Version: v1.1**
+
 ## Features
+
+### Core Inventory (v1.0)
 
 - Collects computer name, OS, manufacturer, model, and serial number
 - Reports total and free physical memory in GB
@@ -16,6 +20,30 @@ A production-style PowerShell inventory reporting tool that collects system and 
 - Generates a formatted `InventoryReport.html` report
 - Includes comment-based help and `try/catch` error handling
 - Displays results in the console and saves files to the `reports` folder
+
+### New in v1.1
+
+- **Disk Health Status** — Automatic Healthy / Warning / Critical classification per drive
+- **Color-Coded HTML Report** — Status badges with green, orange, and red styling
+- **Summary Dashboard** — Drive health overview at the top of the HTML report
+- **Improved System Layout** — Property | Value table format in HTML (cleaner and easier to read)
+- **Report Generation Details** — Footer shows script name, current user, and report version
+
+## Disk Health Status
+
+Each disk is evaluated based on free space percentage (`FreePercent`):
+
+| Free Space | Status | Meaning |
+|------------|--------|---------|
+| ≥ 20% | **Healthy** | Adequate free space |
+| 10% – 19.9% | **Warning** | Low free space — plan cleanup or expansion |
+| < 10% | **Critical** | Very low free space — immediate attention recommended |
+
+Health status appears in:
+
+- Console disk table (`Status` column)
+- CSV export (`Status` column on disk rows)
+- HTML report (color-coded status badges)
 
 ## Requirements
 
@@ -76,10 +104,10 @@ SystemUptime    : 14 days, 6 hours, 22 minutes
 Disk Information
 ----------------
 
-ComputerName DriveLetter TotalSizeGB FreeSpaceGB FreePercent
------------- ----------- ----------- ----------- -----------
-DC01         C           127.5       84.2        66
-DC01         D           500         312.8       62.6
+ComputerName DriveLetter TotalSizeGB FreeSpaceGB FreePercent Status
+------------ ----------- ----------- ----------- ----------- ------
+DC01         C           127.5       84.2        66          Healthy
+DC01         D           500         8.5         1.7         Critical
 
 CSV report saved to:  .\reports\InventoryReport.csv
 HTML report saved to: .\reports\InventoryReport.html
@@ -90,14 +118,27 @@ HTML report saved to: .\reports\InventoryReport.html
 | File | Description |
 |------|-------------|
 | `InventoryReport.csv` | Combined system and disk inventory (RecordType: System / Disk) |
-| `InventoryReport.html` | Formatted HTML report with system and disk tables |
+| `InventoryReport.html` | Dashboard-style HTML report with summary, system info, and disk health |
+
+## Screenshots
+
+Add screenshots of the HTML report to the `screenshots` folder for documentation and portfolio use.
+
+![Server Inventory Report](screenshots/server-inventory-report.png)
 
 ## Technologies Used
 
 - PowerShell
 - WMI / CIM (`Get-CimInstance`)
 - Storage cmdlets (`Get-Volume`)
-- `Export-Csv` and `ConvertTo-Html`
+- `Export-Csv` and custom HTML generation
+
+## Version History
+
+| Version | Description |
+|---------|-------------|
+| **v1.0** | Basic inventory collection — system info, disk details, CSV and HTML export |
+| **v1.1** | Disk health monitoring, color-coded dashboard, summary section, improved HTML layout |
 
 ## Future Enhancements
 
