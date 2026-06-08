@@ -2,41 +2,54 @@
 
 <#
 .SYNOPSIS
-    Generates a server inventory report and exports results to CSV and HTML.
+    Generates a multi-server inventory report and exports results to CSV and HTML.
 
 .DESCRIPTION
-    PowerShell Server Inventory Report v1.1
-    Collects system, hardware, BIOS, CPU, uptime, and disk information from
-    the local computer using CIM and Get-Volume. Exports a combined inventory
-    report to CSV and a formatted HTML report with disk health monitoring,
-    summary dashboard, and color-coded status indicators.
+    PowerShell Server Inventory Report v1.2
+    Reads server names from servers.txt and collects system, hardware, BIOS,
+    CPU, uptime, and disk information from each target using CIM/WMI.
+    Exports a combined inventory report to CSV and a dashboard-style HTML report
+    with server health evaluation, disk health monitoring, and unreachable
+    server handling.
 
 .PARAMETER OutputPath
     Directory where InventoryReport.csv and InventoryReport.html will be saved.
     Defaults to the reports folder in the script directory.
 
+.PARAMETER ServerListFile
+    Path to the server list file. Defaults to servers.txt in the script directory.
+
 .EXAMPLE
     .\ServerInventoryReport.ps1
-    Generates reports in the default .\reports folder.
+    Generates reports for all servers listed in servers.txt.
 
 .EXAMPLE
     .\ServerInventoryReport.ps1 -OutputPath 'C:\Reports'
     Generates reports in a custom output directory.
+
+.EXAMPLE
+    .\ServerInventoryReport.ps1 -ServerListFile '.\my-servers.txt'
+    Uses a custom server list file.
 #>
 
 [CmdletBinding()]
 param(
-    [string]$OutputPath
+    [string]$OutputPath,
+    [string]$ServerListFile
 )
 
 # Variables
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion   = 'v1.1'
+$ScriptVersion    = 'v1.2'
 $ReportScriptName = 'ServerInventoryReport.ps1'
 
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $OutputPath = Join-Path -Path $PSScriptRoot -ChildPath 'reports'
+}
+
+if ([string]::IsNullOrWhiteSpace($ServerListFile)) {
+    $ServerListFile = Join-Path -Path $PSScriptRoot -ChildPath 'servers.txt'
 }
 
 $CsvFileName  = 'InventoryReport.csv'
@@ -57,11 +70,32 @@ $HtmlPath = Join-Path -Path $OutputPath -ChildPath $HtmlFileName
 
 # Functions
 
-function Get-DiskHealthStatus {
+function Get-ServerList {
     <#
     .SYNOPSIS
-        Returns disk health status based on free space percentage.
+        Reads server names from the server list file.
     #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -Path $Path)) {
+        throw "Server list file not found: $Path"
+    }
+
+    $Servers = Get-Content -Path $Path |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith('#') }
+
+    if (-not $Servers) {
+        throw "No servers found in server list file: $Path"
+    }
+
+    return $Servers
+}
+
+function Get-DiskHealthStatus {
     param(
         [Parameter(Mandatory)]
         [double]$FreePercent
@@ -78,6 +112,28 @@ function Get-DiskHealthStatus {
     }
 }
 
+function Get-ServerHealthStatus {
+    <#
+    .SYNOPSIS
+        Determines overall server health based on disk statuses.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$DiskStatuses
+    )
+
+    if ($DiskStatuses -contains 'Critical') {
+        return 'Critical'
+    }
+    elseif ($DiskStatuses -contains 'Warning') {
+        return 'Warning'
+    }
+    else {
+        return 'Healthy'
+    }
+}
+
 function Get-StatusCssClass {
     param(
         [Parameter(Mandatory)]
@@ -85,45 +141,229 @@ function Get-StatusCssClass {
     )
 
     switch ($Status) {
-        'Healthy'  { return 'status-healthy' }
-        'Warning'  { return 'status-warning' }
-        'Critical' { return 'status-critical' }
-        default    { return '' }
+        'Healthy'     { return 'status-healthy' }
+        'Warning'     { return 'status-warning' }
+        'Critical'    { return 'status-critical' }
+        'Unreachable' { return 'status-unreachable' }
+        default       { return '' }
     }
 }
 
-function Get-HtmlSystemInfoTable {
+function Get-UptimeDisplay {
     param(
         [Parameter(Mandatory)]
-        [array]$Rows
+        [datetime]$LastBootUpTime
     )
 
-    $HtmlRows = foreach ($Row in $Rows) {
-        "<tr><td class='property'>$($Row.Property)</td><td class='value'>$($Row.Value)</td></tr>"
+    $Uptime = (Get-Date) - $LastBootUpTime
+    $Detailed = '{0} days, {1} hours, {2} minutes' -f $Uptime.Days, $Uptime.Hours, $Uptime.Minutes
+
+    if ($Uptime.Days -gt 0) {
+        $Short = "$($Uptime.Days) Day$(if ($Uptime.Days -ne 1) { 's' })"
+    }
+    else {
+        $Short = "$($Uptime.Hours) Hour$(if ($Uptime.Hours -ne 1) { 's' })"
+    }
+
+    return [PSCustomObject]@{
+        Detailed = $Detailed
+        Short    = $Short
+    }
+}
+
+function Get-LocalDiskInventory {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName
+    )
+
+    return Get-Volume |
+        Where-Object { $_.DriveLetter -and $_.Size -gt 0 } |
+        ForEach-Object {
+            $FreePercent = [math]::Round(($_.SizeRemaining / $_.Size) * 100, 1)
+
+            [PSCustomObject]@{
+                ComputerName = $ComputerName
+                DriveLetter  = $_.DriveLetter
+                TotalSizeGB  = [math]::Round($_.Size / 1GB, 2)
+                FreeSpaceGB  = [math]::Round($_.SizeRemaining / 1GB, 2)
+                FreePercent  = $FreePercent
+                Status       = Get-DiskHealthStatus -FreePercent $FreePercent
+            }
+        }
+}
+
+function Get-RemoteDiskInventory {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName
+    )
+
+    return Get-CimInstance -ClassName Win32_LogicalDisk -ComputerName $ComputerName -Filter 'DriveType=3' |
+        Where-Object { $_.Size -gt 0 } |
+        ForEach-Object {
+            $FreePercent = [math]::Round(($_.FreeSpace / $_.Size) * 100, 1)
+
+            [PSCustomObject]@{
+                ComputerName = $ComputerName
+                DriveLetter  = $_.DeviceID.TrimEnd(':')
+                TotalSizeGB  = [math]::Round($_.Size / 1GB, 2)
+                FreeSpaceGB  = [math]::Round($_.FreeSpace / 1GB, 2)
+                FreePercent  = $FreePercent
+                Status       = Get-DiskHealthStatus -FreePercent $FreePercent
+            }
+        }
+}
+
+function Get-ServerInventory {
+    <#
+    .SYNOPSIS
+        Collects inventory for a single server using CIM and local disk cmdlets.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ServerName
+    )
+
+    $IsLocal = $ServerName -in @('localhost', '.', '127.0.0.1') -or
+        $ServerName.Equals($env:COMPUTERNAME, [System.StringComparison]::OrdinalIgnoreCase)
+
+    $CimParams = @{}
+    if (-not $IsLocal) {
+        $CimParams['ComputerName'] = $ServerName
+    }
+
+    try {
+        $OperatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem @CimParams -ErrorAction Stop
+        $ComputerSystem  = Get-CimInstance -ClassName Win32_ComputerSystem @CimParams -ErrorAction Stop
+        $Bios            = Get-CimInstance -ClassName Win32_BIOS @CimParams -ErrorAction Stop
+        $Processor       = Get-CimInstance -ClassName Win32_Processor @CimParams -ErrorAction Stop | Select-Object -First 1
+
+        $Uptime = Get-UptimeDisplay -LastBootUpTime $OperatingSystem.LastBootUpTime
+
+        $SystemInventory = [PSCustomObject]@{
+            ServerName      = $ServerName
+            ComputerName    = $ComputerSystem.Name
+            OperatingSystem = $OperatingSystem.Caption
+            OSVersion       = $OperatingSystem.Version
+            Manufacturer    = $ComputerSystem.Manufacturer
+            Model           = $ComputerSystem.Model
+            TotalRAMGB      = [math]::Round($ComputerSystem.TotalPhysicalMemory / 1GB, 2)
+            FreeRAMGB       = [math]::Round($OperatingSystem.FreePhysicalMemory / 1MB, 2)
+            BIOSVersion     = $Bios.SMBIOSBIOSVersion
+            SerialNumber    = $Bios.SerialNumber
+            CPUName         = $Processor.Name
+            SystemUptime    = $Uptime.Detailed
+            UptimeShort     = $Uptime.Short
+            ServerStatus    = 'Healthy'
+            Reachable       = $true
+        }
+
+        if ($IsLocal) {
+            $DiskInventory = @(Get-LocalDiskInventory -ComputerName $SystemInventory.ComputerName)
+        }
+        else {
+            $DiskInventory = @(Get-RemoteDiskInventory -ComputerName $ServerName)
+        }
+
+        $SystemInventory.ServerStatus = Get-ServerHealthStatus -DiskStatuses @($DiskInventory.Status)
+
+        return [PSCustomObject]@{
+            System = $SystemInventory
+            Disks  = $DiskInventory
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            System = [PSCustomObject]@{
+                ServerName      = $ServerName
+                ComputerName    = $ServerName
+                OperatingSystem = ''
+                OSVersion       = ''
+                Manufacturer    = ''
+                Model           = ''
+                TotalRAMGB      = ''
+                FreeRAMGB       = ''
+                BIOSVersion     = ''
+                SerialNumber    = ''
+                CPUName         = ''
+                SystemUptime    = ''
+                UptimeShort     = ''
+                ServerStatus    = 'Unreachable'
+                Reachable       = $false
+                ErrorMessage    = $_.Exception.Message
+            }
+            Disks = @()
+        }
+    }
+}
+
+function Get-HtmlServerStatusTable {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Servers
+    )
+
+    $HtmlRows = foreach ($Server in $Servers) {
+        $StatusClass = Get-StatusCssClass -Status $Server.ServerStatus
+        @"
+        <tr>
+            <td>$($Server.ComputerName)</td>
+            <td>$($Server.OperatingSystem)</td>
+            <td>$($Server.OSVersion)</td>
+            <td>$($Server.Manufacturer)</td>
+            <td>$($Server.Model)</td>
+            <td>$($Server.CPUName)</td>
+            <td>$($Server.TotalRAMGB)</td>
+            <td>$($Server.FreeRAMGB)</td>
+            <td>$($Server.BIOSVersion)</td>
+            <td>$($Server.SerialNumber)</td>
+            <td>$($Server.UptimeShort)</td>
+            <td><span class="status-badge $StatusClass">$($Server.ServerStatus)</span></td>
+        </tr>
+"@
     }
 
     return @"
-<table class="info-table">
+<table class="data-table server-table">
     <thead>
-        <tr><th>Property</th><th>Value</th></tr>
+        <tr>
+            <th>Computer</th>
+            <th>Operating System</th>
+            <th>Version</th>
+            <th>Manufacturer</th>
+            <th>Model</th>
+            <th>CPU</th>
+            <th>Total RAM (GB)</th>
+            <th>Free RAM (GB)</th>
+            <th>BIOS</th>
+            <th>Serial</th>
+            <th>Uptime</th>
+            <th>Status</th>
+        </tr>
     </thead>
     <tbody>
-        $($HtmlRows -join "`n        ")
+        $($HtmlRows -join "`n")
     </tbody>
 </table>
 "@
 }
 
-function Get-HtmlDiskTable {
+function Get-HtmlDiskDetailsTable {
     param(
         [Parameter(Mandatory)]
         [array]$Disks
     )
 
+    if (-not $Disks) {
+        return '<p class="no-data">No disk information available.</p>'
+    }
+
     $HtmlRows = foreach ($Disk in $Disks) {
         $StatusClass = Get-StatusCssClass -Status $Disk.Status
         @"
         <tr>
+            <td>$($Disk.ComputerName)</td>
             <td>$($Disk.DriveLetter)</td>
             <td>$($Disk.TotalSizeGB) GB</td>
             <td>$($Disk.FreeSpaceGB) GB</td>
@@ -137,6 +377,7 @@ function Get-HtmlDiskTable {
 <table class="data-table">
     <thead>
         <tr>
+            <th>Computer</th>
             <th>Drive</th>
             <th>Total Size</th>
             <th>Free Space</th>
@@ -151,156 +392,35 @@ function Get-HtmlDiskTable {
 "@
 }
 
-# System Information
-
-try {
-    $OperatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem
-    $ComputerSystem  = Get-CimInstance -ClassName Win32_ComputerSystem
-    $Bios            = Get-CimInstance -ClassName Win32_BIOS
-    $Processor       = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1
-}
-catch {
-    Write-Error "Unable to retrieve system information. $_"
-    exit 1
-}
-
-$LastBoot = $OperatingSystem.LastBootUpTime
-$Uptime   = (Get-Date) - $LastBoot
-$UptimeFormatted = '{0} days, {1} hours, {2} minutes' -f $Uptime.Days, $Uptime.Hours, $Uptime.Minutes
-
-if ($Uptime.Days -gt 0) {
-    $UptimeHtmlDisplay = "$($Uptime.Days) Day$(if ($Uptime.Days -ne 1) { 's' })"
-}
-else {
-    $UptimeHtmlDisplay = "$($Uptime.Hours) Hour$(if ($Uptime.Hours -ne 1) { 's' })"
-}
-
-$SystemInventory = [PSCustomObject]@{
-    ComputerName    = $env:COMPUTERNAME
-    OperatingSystem = $OperatingSystem.Caption
-    OSVersion       = $OperatingSystem.Version
-    Manufacturer    = $ComputerSystem.Manufacturer
-    Model           = $ComputerSystem.Model
-    TotalRAMGB      = [math]::Round($ComputerSystem.TotalPhysicalMemory / 1GB, 2)
-    FreeRAMGB       = [math]::Round($OperatingSystem.FreePhysicalMemory / 1MB, 2)
-    BIOSVersion     = $Bios.SMBIOSBIOSVersion
-    SerialNumber    = $Bios.SerialNumber
-    CPUName         = $Processor.Name
-    SystemUptime    = $UptimeFormatted
-}
-
-# Disk Information
-
-try {
-    $DiskInventory = Get-Volume |
-        Where-Object { $_.DriveLetter -and $_.Size -gt 0 } |
-        ForEach-Object {
-            $FreePercent = [math]::Round(($_.SizeRemaining / $_.Size) * 100, 1)
-
-            [PSCustomObject]@{
-                ComputerName = $env:COMPUTERNAME
-                DriveLetter  = $_.DriveLetter
-                TotalSizeGB  = [math]::Round($_.Size / 1GB, 2)
-                FreeSpaceGB  = [math]::Round($_.SizeRemaining / 1GB, 2)
-                FreePercent  = $FreePercent
-                Status       = Get-DiskHealthStatus -FreePercent $FreePercent
-            }
-        }
-}
-catch {
-    Write-Error "Unable to retrieve disk information. $_"
-    exit 1
-}
-
-# Disk Health Summary
-
-$DiskSummary = [PSCustomObject]@{
-    TotalDrives    = $DiskInventory.Count
-    HealthyDrives  = @($DiskInventory | Where-Object Status -eq 'Healthy').Count
-    WarningDrives  = @($DiskInventory | Where-Object Status -eq 'Warning').Count
-    CriticalDrives = @($DiskInventory | Where-Object Status -eq 'Critical').Count
-}
-
-# Export Reports
-
-try {
-    $CsvExport = @(
-        [PSCustomObject]@{
-            RecordType      = 'System'
-            ComputerName    = $SystemInventory.ComputerName
-            OperatingSystem = $SystemInventory.OperatingSystem
-            OSVersion       = $SystemInventory.OSVersion
-            Manufacturer    = $SystemInventory.Manufacturer
-            Model           = $SystemInventory.Model
-            TotalRAMGB      = $SystemInventory.TotalRAMGB
-            FreeRAMGB       = $SystemInventory.FreeRAMGB
-            BIOSVersion     = $SystemInventory.BIOSVersion
-            SerialNumber    = $SystemInventory.SerialNumber
-            CPUName         = $SystemInventory.CPUName
-            SystemUptime    = $SystemInventory.SystemUptime
-            DriveLetter     = ''
-            TotalSizeGB     = ''
-            FreeSpaceGB     = ''
-            FreePercent     = ''
-            Status          = ''
-        }
+function Write-DiskConsoleTable {
+    <#
+    .SYNOPSIS
+        Writes disk inventory to the console in a readable table format.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [array]$Disks
     )
 
-    foreach ($Disk in $DiskInventory) {
-        $CsvExport += [PSCustomObject]@{
-            RecordType      = 'Disk'
-            ComputerName    = $Disk.ComputerName
-            OperatingSystem = ''
-            OSVersion       = ''
-            Manufacturer    = ''
-            Model           = ''
-            TotalRAMGB      = ''
-            FreeRAMGB       = ''
-            BIOSVersion     = ''
-            SerialNumber    = ''
-            CPUName         = ''
-            SystemUptime    = ''
-            DriveLetter     = $Disk.DriveLetter
-            TotalSizeGB     = $Disk.TotalSizeGB
-            FreeSpaceGB     = $Disk.FreeSpaceGB
-            FreePercent     = $Disk.FreePercent
-            Status          = $Disk.Status
-        }
+    if (-not $Disks) {
+        return
     }
 
-    $CsvExport | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+    $Disks |
+        Select-Object `
+            @{Name = 'ComputerName'; Expression = { $_.ComputerName } }, `
+            @{Name = 'DriveLetter';  Expression = { $_.DriveLetter } }, `
+            @{Name = 'TotalSizeGB';  Expression = { $_.TotalSizeGB } }, `
+            @{Name = 'FreeSpaceGB';  Expression = { $_.FreeSpaceGB } }, `
+            @{Name = 'FreePercent';  Expression = { $_.FreePercent } }, `
+            @{Name = 'Status';       Expression = { $_.Status } } |
+        Format-Table -Property ComputerName, DriveLetter, TotalSizeGB, FreeSpaceGB, FreePercent, Status -AutoSize |
+        Out-String -Width 250 |
+        ForEach-Object { Write-Host $_ }
+}
 
-    # HTML Report
-
-    $ReportDate  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $ReportDateShort = Get-Date -Format 'yyyy-MM-dd'
-    $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-
-    $SystemInfoRows = @(
-        @{ Property = 'Computer Name';    Value = $SystemInventory.ComputerName }
-        @{ Property = 'Operating System'; Value = $SystemInventory.OperatingSystem }
-        @{ Property = 'Version';          Value = $SystemInventory.OSVersion }
-        @{ Property = 'Manufacturer';     Value = $SystemInventory.Manufacturer }
-        @{ Property = 'Model';            Value = $SystemInventory.Model }
-        @{ Property = 'CPU';              Value = $SystemInventory.CPUName }
-        @{ Property = 'Total RAM';        Value = "$($SystemInventory.TotalRAMGB) GB" }
-        @{ Property = 'Free RAM';         Value = "$($SystemInventory.FreeRAMGB) GB" }
-        @{ Property = 'BIOS Version';     Value = $SystemInventory.BIOSVersion }
-        @{ Property = 'Serial Number';    Value = $SystemInventory.SerialNumber }
-        @{ Property = 'Uptime';           Value = $UptimeHtmlDisplay }
-    )
-
-    $SystemHtml = Get-HtmlSystemInfoTable -Rows $SystemInfoRows
-    $DiskHtml   = Get-HtmlDiskTable -Disks $DiskInventory
-
-    $HtmlReport = @"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Server Inventory Report - $($SystemInventory.ComputerName)</title>
-    <style>
+function Get-HtmlStyles {
+    return @'
         * { box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
@@ -311,7 +431,7 @@ try {
             line-height: 1.5;
         }
         .container {
-            max-width: 980px;
+            max-width: 1200px;
             margin: 0 auto;
             background: #ffffff;
             padding: 36px;
@@ -348,7 +468,7 @@ try {
         }
         .summary-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
             gap: 16px;
             margin-top: 16px;
         }
@@ -372,6 +492,7 @@ try {
         .summary-card.healthy .value { color: #107c10; }
         .summary-card.warning .value { color: #d97706; }
         .summary-card.critical .value { color: #c50f1f; }
+        .summary-card.failed .value { color: #6b7280; }
         .summary-meta {
             margin-top: 16px;
             color: #4b5563;
@@ -382,31 +503,26 @@ try {
             width: 100%;
             margin-top: 8px;
         }
-        .info-table th,
         .data-table th {
             background-color: #0078d4;
             color: #ffffff;
             text-align: left;
             padding: 12px 14px;
             font-weight: 600;
+            white-space: nowrap;
         }
-        .info-table td,
         .data-table td {
             padding: 11px 14px;
             border-bottom: 1px solid #e5e7eb;
             vertical-align: top;
         }
-        .info-table tr:nth-child(even),
         .data-table tr:nth-child(even) {
             background-color: #f9fafb;
         }
-        .info-table td.property {
-            width: 35%;
-            font-weight: 600;
-            color: #374151;
-        }
-        .info-table td.value {
-            color: #111827;
+        .server-table {
+            display: block;
+            overflow-x: auto;
+            white-space: nowrap;
         }
         .status-badge {
             display: inline-block;
@@ -428,6 +544,14 @@ try {
             background-color: #fde7e9;
             color: #c50f1f;
         }
+        .status-unreachable {
+            background-color: #f3f4f6;
+            color: #6b7280;
+        }
+        .no-data {
+            color: #6b7280;
+            font-style: italic;
+        }
         .footer {
             margin-top: 36px;
             padding-top: 18px;
@@ -439,43 +563,161 @@ try {
         .footer p {
             margin: 4px 0;
         }
+'@
+}
+
+# Read Server List
+
+try {
+    $ServerNames = Get-ServerList -Path $ServerListFile
+}
+catch {
+    Write-Error $_
+    exit 1
+}
+
+# Collect Inventory
+
+$InventoryResults = foreach ($ServerName in $ServerNames) {
+    Write-Verbose "Collecting inventory for: $ServerName"
+    Get-ServerInventory -ServerName $ServerName
+}
+
+$AllServers = @($InventoryResults | ForEach-Object { $_.System })
+$AllDisks   = @($InventoryResults | ForEach-Object { $_.Disks })
+
+# Dashboard Summary
+
+$ServerSummary = [PSCustomObject]@{
+    TotalServers    = $AllServers.Count
+    HealthyServers  = @($AllServers | Where-Object ServerStatus -eq 'Healthy').Count
+    WarningServers  = @($AllServers | Where-Object ServerStatus -eq 'Warning').Count
+    CriticalServers = @($AllServers | Where-Object ServerStatus -eq 'Critical').Count
+    FailedServers   = @($AllServers | Where-Object ServerStatus -eq 'Unreachable').Count
+    TotalDrives     = $AllDisks.Count
+    HealthyDrives   = @($AllDisks | Where-Object Status -eq 'Healthy').Count
+    WarningDrives   = @($AllDisks | Where-Object Status -eq 'Warning').Count
+    CriticalDrives  = @($AllDisks | Where-Object Status -eq 'Critical').Count
+}
+
+# Export Reports
+
+try {
+    $CsvExport = @()
+
+    foreach ($Server in $AllServers) {
+        $CsvExport += [PSCustomObject]@{
+            RecordType      = 'Server'
+            ServerName      = $Server.ServerName
+            ComputerName    = $Server.ComputerName
+            OperatingSystem = $Server.OperatingSystem
+            OSVersion       = $Server.OSVersion
+            Manufacturer    = $Server.Manufacturer
+            Model           = $Server.Model
+            TotalRAMGB      = $Server.TotalRAMGB
+            FreeRAMGB       = $Server.FreeRAMGB
+            BIOSVersion     = $Server.BIOSVersion
+            SerialNumber    = $Server.SerialNumber
+            CPUName         = $Server.CPUName
+            SystemUptime    = $Server.SystemUptime
+            DriveLetter     = ''
+            TotalSizeGB     = ''
+            FreeSpaceGB     = ''
+            FreePercent     = ''
+            Status          = $Server.ServerStatus
+        }
+    }
+
+    foreach ($Disk in $AllDisks) {
+        $CsvExport += [PSCustomObject]@{
+            RecordType      = 'Disk'
+            ServerName      = $Disk.ComputerName
+            ComputerName    = $Disk.ComputerName
+            OperatingSystem = ''
+            OSVersion       = ''
+            Manufacturer    = ''
+            Model           = ''
+            TotalRAMGB      = ''
+            FreeRAMGB       = ''
+            BIOSVersion     = ''
+            SerialNumber    = ''
+            CPUName         = ''
+            SystemUptime    = ''
+            DriveLetter     = $Disk.DriveLetter
+            TotalSizeGB     = $Disk.TotalSizeGB
+            FreeSpaceGB     = $Disk.FreeSpaceGB
+            FreePercent     = $Disk.FreePercent
+            Status          = $Disk.Status
+        }
+    }
+
+    $CsvExport | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+
+    # HTML Report
+
+    $ReportDate      = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $ReportDateShort = Get-Date -Format 'yyyy-MM-dd'
+    $CurrentUser     = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $ServerHtml      = Get-HtmlServerStatusTable -Servers $AllServers
+    $DiskHtml        = Get-HtmlDiskDetailsTable -Disks $AllDisks
+
+    $HtmlReport = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Server Inventory Report</title>
+    <style>
+$(Get-HtmlStyles)
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Server Inventory Report</h1>
-        <p class="subtitle">Automated inventory and disk health report for $($SystemInventory.ComputerName)</p>
+        <h1>Multi-Server Inventory Report</h1>
+        <p class="subtitle">Automated inventory and health dashboard for $($ServerSummary.TotalServers) server(s)</p>
 
         <div class="summary-panel">
-            <h2>Server Inventory Summary</h2>
+            <h2>Server Summary</h2>
             <div class="summary-meta">
-                <strong>Computer Name:</strong> $($SystemInventory.ComputerName)<br>
-                <strong>Generated:</strong> $ReportDateShort
+                <strong>Generated:</strong> $ReportDateShort &nbsp;|&nbsp;
+                <strong>Servers Scanned:</strong> $($ServerSummary.TotalServers)
             </div>
             <div class="summary-grid">
                 <div class="summary-card">
-                    <div class="label">Total Drives</div>
-                    <div class="value">$($DiskSummary.TotalDrives)</div>
+                    <div class="label">Total Servers</div>
+                    <div class="value">$($ServerSummary.TotalServers)</div>
                 </div>
                 <div class="summary-card healthy">
-                    <div class="label">Healthy Drives</div>
-                    <div class="value">$($DiskSummary.HealthyDrives)</div>
+                    <div class="label">Healthy Servers</div>
+                    <div class="value">$($ServerSummary.HealthyServers)</div>
                 </div>
                 <div class="summary-card warning">
-                    <div class="label">Warning Drives</div>
-                    <div class="value">$($DiskSummary.WarningDrives)</div>
+                    <div class="label">Warning Servers</div>
+                    <div class="value">$($ServerSummary.WarningServers)</div>
                 </div>
                 <div class="summary-card critical">
-                    <div class="label">Critical Drives</div>
-                    <div class="value">$($DiskSummary.CriticalDrives)</div>
+                    <div class="label">Critical Servers</div>
+                    <div class="value">$($ServerSummary.CriticalServers)</div>
                 </div>
+                <div class="summary-card failed">
+                    <div class="label">Failed Servers</div>
+                    <div class="value">$($ServerSummary.FailedServers)</div>
+                </div>
+            </div>
+            <div class="summary-meta">
+                <strong>Disk Summary:</strong>
+                $($ServerSummary.TotalDrives) drives |
+                $($ServerSummary.HealthyDrives) healthy |
+                $($ServerSummary.WarningDrives) warning |
+                $($ServerSummary.CriticalDrives) critical
             </div>
         </div>
 
-        <h2>System Information</h2>
-        $SystemHtml
+        <h2>Server Status</h2>
+        $ServerHtml
 
-        <h2>Disk Information</h2>
+        <h2>Disk Details</h2>
         $DiskHtml
 
         <div class="footer">
@@ -502,12 +744,36 @@ Write-Host '==============================='
 Write-Host ' Server Inventory Report'
 Write-Host '==============================='
 Write-Host ''
-Write-Host 'System Information'
-Write-Host '------------------'
-$SystemInventory | Format-List
-Write-Host 'Disk Information'
-Write-Host '----------------'
-$DiskInventory | Format-Table -AutoSize
+Write-Host 'Server Summary'
+Write-Host '--------------'
+$ServerSummary | Format-List
 Write-Host ''
+
+foreach ($Result in $InventoryResults) {
+    $Server = $Result.System
+
+    Write-Host "Server: $($Server.ComputerName) [$($Server.ServerStatus)]"
+    Write-Host '----------------------------------------'
+
+    if ($Server.Reachable) {
+        $Server | Select-Object ComputerName, OperatingSystem, OSVersion, Manufacturer, Model,
+            TotalRAMGB, FreeRAMGB, BIOSVersion, SerialNumber, CPUName, SystemUptime |
+            Format-List
+
+        if ($Result.Disks) {
+            Write-Host 'Disk Information'
+            Write-DiskConsoleTable -Disks $Result.Disks
+        }
+    }
+    else {
+        Write-Warning "Unable to reach server '$($Server.ServerName)'. Status: Unreachable"
+        if ($Server.ErrorMessage) {
+            Write-Host "  Error: $($Server.ErrorMessage)"
+        }
+    }
+
+    Write-Host ''
+}
+
 Write-Host "CSV report saved to:  $CsvPath"
 Write-Host "HTML report saved to: $HtmlPath"

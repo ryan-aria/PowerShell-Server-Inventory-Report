@@ -1,12 +1,12 @@
 # PowerShell Server Inventory Report
 
-A production-style PowerShell inventory reporting tool that collects system and disk information from a local Windows computer and exports results to CSV and HTML.
+A production-style PowerShell inventory reporting tool that collects system and disk information from multiple Windows servers and exports results to CSV and HTML.
 
 ## Overview
 
-**PowerShell Server Inventory Report** is designed for System Administrators who need a quick, repeatable way to document server hardware, operating system details, and disk usage. The script uses CIM/WMI and native PowerShell cmdlets, then exports professional reports suitable for audits, change records, and portfolio demonstrations.
+**PowerShell Server Inventory Report** is designed for System Administrators who need a quick, repeatable way to document server hardware, operating system details, and disk usage across one or many systems. The script uses CIM/WMI for remote collection, evaluates server and disk health, and exports professional reports suitable for audits, change records, and portfolio demonstrations.
 
-**Current Version: v1.1**
+**Current Version: v1.2**
 
 ## Features
 
@@ -21,13 +21,38 @@ A production-style PowerShell inventory reporting tool that collects system and 
 - Includes comment-based help and `try/catch` error handling
 - Displays results in the console and saves files to the `reports` folder
 
-### New in v1.1
+### Disk Health Dashboard (v1.1)
 
 - **Disk Health Status** — Automatic Healthy / Warning / Critical classification per drive
 - **Color-Coded HTML Report** — Status badges with green, orange, and red styling
-- **Summary Dashboard** — Drive health overview at the top of the HTML report
-- **Improved System Layout** — Property | Value table format in HTML (cleaner and easier to read)
+- **Summary Dashboard** — Drive health overview in the HTML report
+- **Improved System Layout** — Property | Value table format (single-server HTML, superseded by v1.2 dashboard for multi-server)
 - **Report Generation Details** — Footer shows script name, current user, and report version
+
+### Multi-Server Inventory (v1.2)
+
+- **Multi-Server Support** — Reads server names from `servers.txt`
+- **Remote Collection** — Gathers inventory from remote servers via CIM
+- **Server Health Evaluation** — Healthy / Warning / Critical based on worst disk status
+- **Unreachable Server Handling** — Failed servers recorded as `Unreachable` without stopping execution
+- **Dashboard Summary** — Total, Healthy, Warning, Critical, and Failed server counts
+- **Server Status Table** — All servers with inventory and health status in HTML
+- **Disk Details Table** — Combined disk inventory across all servers
+
+## Server List Configuration
+
+Create or edit `servers.txt` in the project root:
+
+```text
+# Production servers
+localhost
+SRV01
+SRV02
+
+# Add one server name per line
+# Lines starting with # are ignored
+# Blank lines are skipped
+```
 
 ## Disk Health Status
 
@@ -39,40 +64,46 @@ Each disk is evaluated based on free space percentage (`FreePercent`):
 | 10% – 19.9% | **Warning** | Low free space — plan cleanup or expansion |
 | < 10% | **Critical** | Very low free space — immediate attention recommended |
 
-Health status appears in:
+### Server Health Rules
 
-- Console disk table (`Status` column)
-- CSV export (`Status` column on disk rows)
-- HTML report (color-coded status badges)
+| Condition | Server Status |
+|-----------|---------------|
+| Any disk is Critical | **Critical** |
+| Any disk is Warning (no Critical) | **Warning** |
+| All disks Healthy | **Healthy** |
+| Server cannot be reached | **Unreachable** |
 
 ## Requirements
 
 - Windows PowerShell 5.1 or PowerShell 7+
 - Windows Server or Windows client with CIM/WMI access
+- Network connectivity and permissions for remote WMI/CIM (remote servers)
 - Write permissions to the output directory (default: `.\reports`)
 
 ## Usage
 
 1. Clone or download this repository.
-2. Open PowerShell and navigate to the project folder:
+2. Edit `servers.txt` with your target server names.
+3. Open PowerShell and navigate to the project folder:
 
    ```powershell
    cd PowerShell-Server-Inventory-Report
    ```
 
-3. Run the script:
+4. Run the script:
 
    ```powershell
    .\ServerInventoryReport.ps1
    ```
 
-4. Optional — specify a custom output path:
+5. Optional parameters:
 
    ```powershell
    .\ServerInventoryReport.ps1 -OutputPath 'C:\Reports'
+   .\ServerInventoryReport.ps1 -ServerListFile '.\my-servers.txt'
    ```
 
-5. Open the generated files:
+6. Open the generated files:
 
    - `reports\InventoryReport.csv`
    - `reports\InventoryReport.html`
@@ -86,28 +117,22 @@ Health status appears in:
  Server Inventory Report
 ===============================
 
-System Information
-------------------
+Server Summary
+--------------
 
-ComputerName    : DC01
-OperatingSystem : Microsoft Windows Server 2022 Standard
-OSVersion       : 10.0.20348
-Manufacturer    : Dell Inc.
-Model           : PowerEdge R740
-TotalRAMGB      : 32
-FreeRAMGB       : 18.45
-BIOSVersion     : 2.15.0
-SerialNumber    : ABCD1234
-CPUName         : Intel(R) Xeon(R) Gold 6230 CPU @ 2.10GHz
-SystemUptime    : 14 days, 6 hours, 22 minutes
+TotalServers    : 3
+HealthyServers  : 1
+WarningServers  : 1
+CriticalServers : 1
+FailedServers   : 0
+TotalDrives     : 4
+HealthyDrives   : 2
+WarningDrives   : 1
+CriticalDrives  : 1
 
-Disk Information
-----------------
-
-ComputerName DriveLetter TotalSizeGB FreeSpaceGB FreePercent Status
------------- ----------- ----------- ----------- ----------- ------
-DC01         C           127.5       84.2        66          Healthy
-DC01         D           500         8.5         1.7         Critical
+Server: DRAGON [Critical]
+----------------------------------------
+...
 
 CSV report saved to:  .\reports\InventoryReport.csv
 HTML report saved to: .\reports\InventoryReport.html
@@ -117,8 +142,8 @@ HTML report saved to: .\reports\InventoryReport.html
 
 | File | Description |
 |------|-------------|
-| `InventoryReport.csv` | Combined system and disk inventory (RecordType: System / Disk) |
-| `InventoryReport.html` | Dashboard-style HTML report with summary, system info, and disk health |
+| `InventoryReport.csv` | All server and disk records (RecordType: Server / Disk) |
+| `InventoryReport.html` | Multi-server dashboard with summary, server status, and disk details |
 
 ## Screenshots
 
@@ -130,19 +155,20 @@ Add screenshots of the HTML report to the `screenshots` folder for documentation
 
 - PowerShell
 - WMI / CIM (`Get-CimInstance`)
-- Storage cmdlets (`Get-Volume`)
+- Storage cmdlets (`Get-Volume` for local disks)
 - `Export-Csv` and custom HTML generation
 
 ## Version History
 
 | Version | Description |
 |---------|-------------|
-| **v1.0** | Basic inventory collection — system info, disk details, CSV and HTML export |
-| **v1.1** | Disk health monitoring, color-coded dashboard, summary section, improved HTML layout |
+| **v1.0** | Initial release — basic inventory collection, CSV and HTML export |
+| **v1.1** | Disk health dashboard — health status, color-coded HTML, summary section |
+| **v1.2** | Multi-server inventory — remote collection, server health evaluation, unreachable handling |
 
 ## Future Enhancements
 
-- Multi-server inventory from a server list file
+- Credential parameter for remote authentication
 - Scheduled task deployment guide
 - Network adapter and IP address reporting
 - Installed software and Windows Update status

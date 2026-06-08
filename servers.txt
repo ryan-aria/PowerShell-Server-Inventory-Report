@@ -1,0 +1,4 @@
+# Server Inventory List
+# One server name per line. Blank lines and lines starting with # are ignored.
+
+localhost
