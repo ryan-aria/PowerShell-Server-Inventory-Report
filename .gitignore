@@ -16,6 +16,7 @@ Desktop.ini
 # Generated reports
 reports/*
 !reports/.gitkeep
+reports/*.json
 
 # Screenshots
 screenshots/*

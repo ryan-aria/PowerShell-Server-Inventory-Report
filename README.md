@@ -1,12 +1,12 @@
 # PowerShell Server Inventory Report
 
-A production-style PowerShell inventory reporting tool that collects system and disk information from multiple Windows servers and exports results to CSV and HTML.
+A production-style PowerShell inventory reporting tool that collects system and disk information from multiple Windows servers and exports results to CSV, HTML, and JSON.
 
 ## Overview
 
 **PowerShell Server Inventory Report** is designed for System Administrators who need a quick, repeatable way to document server hardware, operating system details, and disk usage across one or many systems. The script uses CIM/WMI for remote collection, evaluates server and disk health, and exports professional reports suitable for audits, change records, and portfolio demonstrations.
 
-**Current Version: v1.2**
+**Current Version: v1.3**
 
 ## Features
 
@@ -38,6 +38,13 @@ A production-style PowerShell inventory reporting tool that collects system and 
 - **Dashboard Summary** — Total, Healthy, Warning, Critical, and Failed server counts
 - **Server Status Table** — All servers with inventory and health status in HTML
 - **Disk Details Table** — Combined disk inventory across all servers
+
+### JSON Export (v1.3)
+
+- **JSON Report** — Exports `InventoryReport.json` alongside CSV and HTML
+- **InfraOps Dashboard Ready** — Structured camelCase JSON designed as a collector engine for the future InfraOps Dashboard web application
+- **Machine-Readable Output** — Includes server summary, server inventory, disk details, and failed server records
+- **API-Friendly Schema** — Consistent property names suitable for ingestion by web dashboards and automation pipelines
 
 ## Server List Configuration
 
@@ -107,6 +114,7 @@ Each disk is evaluated based on free space percentage (`FreePercent`):
 
    - `reports\InventoryReport.csv`
    - `reports\InventoryReport.html`
+   - `reports\InventoryReport.json`
 
 ## Example Output
 
@@ -136,6 +144,7 @@ Server: DRAGON [Critical]
 
 CSV report saved to:  .\reports\InventoryReport.csv
 HTML report saved to: .\reports\InventoryReport.html
+JSON report saved to: .\reports\InventoryReport.json
 ```
 
 ### Exported Files
@@ -144,6 +153,47 @@ HTML report saved to: .\reports\InventoryReport.html
 |------|-------------|
 | `InventoryReport.csv` | All server and disk records (RecordType: Server / Disk) |
 | `InventoryReport.html` | Multi-server dashboard with summary, server status, and disk details |
+| `InventoryReport.json` | Structured JSON for InfraOps Dashboard and automation integration |
+
+### JSON Structure
+
+```json
+{
+  "reportVersion": "v1.3",
+  "generatedAt": "2026-06-07T19:30:00",
+  "generatedBy": "ServerInventoryReport.ps1",
+  "serverSummary": {
+    "totalServers": 1,
+    "healthyServers": 0,
+    "warningServers": 0,
+    "criticalServers": 1,
+    "failedServers": 0,
+    "totalDrives": 2,
+    "healthyDrives": 0,
+    "warningDrives": 1,
+    "criticalDrives": 1
+  },
+  "servers": [
+    {
+      "computerName": "DRAGON",
+      "operatingSystem": "Microsoft Windows 11 Pro",
+      "osVersion": "10.0.26200",
+      "serverStatus": "Critical"
+    }
+  ],
+  "disks": [
+    {
+      "computerName": "DRAGON",
+      "driveLetter": "C",
+      "totalSizeGB": 117.91,
+      "freeSpaceGB": 9.47,
+      "freePercent": 8,
+      "status": "Critical"
+    }
+  ],
+  "failedServers": []
+}
+```
 
 ## Screenshots
 
@@ -156,7 +206,7 @@ Add screenshots of the HTML report to the `screenshots` folder for documentation
 - PowerShell
 - WMI / CIM (`Get-CimInstance`)
 - Storage cmdlets (`Get-Volume` for local disks)
-- `Export-Csv` and custom HTML generation
+- `Export-Csv`, `ConvertTo-Json`, and custom HTML generation
 
 ## Version History
 
@@ -165,14 +215,15 @@ Add screenshots of the HTML report to the `screenshots` folder for documentation
 | **v1.0** | Initial release — basic inventory collection, CSV and HTML export |
 | **v1.1** | Disk health dashboard — health status, color-coded HTML, summary section |
 | **v1.2** | Multi-server inventory — remote collection, server health evaluation, unreachable handling |
+| **v1.3** | JSON export — InfraOps Dashboard integration, machine-readable collector output |
 
 ## Future Enhancements
 
+- InfraOps Dashboard web application integration
 - Credential parameter for remote authentication
 - Scheduled task deployment guide
 - Network adapter and IP address reporting
 - Installed software and Windows Update status
-- Export to JSON for automation pipelines
 - Email report delivery option
 - Azure VM inventory integration
 

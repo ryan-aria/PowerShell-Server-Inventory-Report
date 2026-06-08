@@ -2,18 +2,17 @@
 
 <#
 .SYNOPSIS
-    Generates a multi-server inventory report and exports results to CSV and HTML.
+    Generates a multi-server inventory report and exports results to CSV, HTML, and JSON.
 
 .DESCRIPTION
-    PowerShell Server Inventory Report v1.2
+    PowerShell Server Inventory Report v1.3
     Reads server names from servers.txt and collects system, hardware, BIOS,
     CPU, uptime, and disk information from each target using CIM/WMI.
-    Exports a combined inventory report to CSV and a dashboard-style HTML report
-    with server health evaluation, disk health monitoring, and unreachable
-    server handling.
+    Exports a combined inventory report to CSV, a dashboard-style HTML report,
+    and a JSON report for InfraOps Dashboard integration.
 
 .PARAMETER OutputPath
-    Directory where InventoryReport.csv and InventoryReport.html will be saved.
+    Directory where InventoryReport.csv, InventoryReport.html, and InventoryReport.json will be saved.
     Defaults to the reports folder in the script directory.
 
 .PARAMETER ServerListFile
@@ -41,7 +40,7 @@ param(
 # Variables
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion    = 'v1.2'
+$ScriptVersion    = 'v1.3'
 $ReportScriptName = 'ServerInventoryReport.ps1'
 
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
@@ -54,6 +53,7 @@ if ([string]::IsNullOrWhiteSpace($ServerListFile)) {
 
 $CsvFileName  = 'InventoryReport.csv'
 $HtmlFileName = 'InventoryReport.html'
+$JsonFileName = 'InventoryReport.json'
 
 if (-not (Test-Path -Path $OutputPath)) {
     try {
@@ -67,6 +67,7 @@ if (-not (Test-Path -Path $OutputPath)) {
 
 $CsvPath  = Join-Path -Path $OutputPath -ChildPath $CsvFileName
 $HtmlPath = Join-Path -Path $OutputPath -ChildPath $HtmlFileName
+$JsonPath = Join-Path -Path $OutputPath -ChildPath $JsonFileName
 
 # Functions
 
@@ -390,6 +391,94 @@ function Get-HtmlDiskDetailsTable {
     </tbody>
 </table>
 "@
+}
+
+function Export-InventoryJson {
+    <#
+    .SYNOPSIS
+        Builds and exports the inventory report as JSON for dashboard integration.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$Version,
+
+        [Parameter(Mandatory)]
+        [string]$GeneratedBy,
+
+        [Parameter(Mandatory)]
+        [object]$Summary,
+
+        [Parameter(Mandatory)]
+        [array]$Servers,
+
+        [Parameter(Mandatory)]
+        [array]$Disks
+    )
+
+    $ReachableServers = @($Servers | Where-Object { $_.Reachable })
+    $FailedServers    = @($Servers | Where-Object { -not $_.Reachable })
+
+    $JsonReport = [ordered]@{
+        reportVersion = $Version
+        generatedAt   = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+        generatedBy   = $GeneratedBy
+        serverSummary = [ordered]@{
+            totalServers    = $Summary.TotalServers
+            healthyServers  = $Summary.HealthyServers
+            warningServers  = $Summary.WarningServers
+            criticalServers = $Summary.CriticalServers
+            failedServers   = $Summary.FailedServers
+            totalDrives     = $Summary.TotalDrives
+            healthyDrives   = $Summary.HealthyDrives
+            warningDrives   = $Summary.WarningDrives
+            criticalDrives  = $Summary.CriticalDrives
+        }
+        servers = @(
+            foreach ($Server in $ReachableServers) {
+                [ordered]@{
+                    computerName    = $Server.ComputerName
+                    operatingSystem = $Server.OperatingSystem
+                    osVersion       = $Server.OSVersion
+                    manufacturer    = $Server.Manufacturer
+                    model           = $Server.Model
+                    totalRamGB      = [double]$Server.TotalRAMGB
+                    freeRamGB       = [double]$Server.FreeRAMGB
+                    biosVersion     = $Server.BIOSVersion
+                    serialNumber    = $Server.SerialNumber
+                    cpuName         = $Server.CPUName
+                    systemUptime    = $Server.UptimeShort
+                    serverStatus    = $Server.ServerStatus
+                }
+            }
+        )
+        disks = @(
+            foreach ($Disk in $Disks) {
+                [ordered]@{
+                    computerName = $Disk.ComputerName
+                    driveLetter  = [string]$Disk.DriveLetter
+                    totalSizeGB  = [double]$Disk.TotalSizeGB
+                    freeSpaceGB  = [double]$Disk.FreeSpaceGB
+                    freePercent  = [double]$Disk.FreePercent
+                    status       = $Disk.Status
+                }
+            }
+        )
+        failedServers = @(
+            foreach ($Server in $FailedServers) {
+                [ordered]@{
+                    serverName    = $Server.ServerName
+                    computerName  = $Server.ComputerName
+                    serverStatus  = $Server.ServerStatus
+                    errorMessage  = $Server.ErrorMessage
+                }
+            }
+        )
+    }
+
+    $JsonReport | ConvertTo-Json -Depth 5 | Out-File -FilePath $Path -Encoding UTF8
 }
 
 function Write-DiskConsoleTable {
@@ -732,6 +821,15 @@ $(Get-HtmlStyles)
 "@
 
     $HtmlReport | Out-File -FilePath $HtmlPath -Encoding UTF8
+
+    # JSON Report
+
+    Export-InventoryJson -Path $JsonPath `
+        -Version $ScriptVersion `
+        -GeneratedBy $ReportScriptName `
+        -Summary $ServerSummary `
+        -Servers $AllServers `
+        -Disks $AllDisks
 }
 catch {
     Write-Error "Unable to export inventory reports. $_"
@@ -777,3 +875,4 @@ foreach ($Result in $InventoryResults) {
 
 Write-Host "CSV report saved to:  $CsvPath"
 Write-Host "HTML report saved to: $HtmlPath"
+Write-Host "JSON report saved to: $JsonPath"
