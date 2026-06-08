@@ -1,12 +1,12 @@
 # PowerShell Server Inventory Report
 
-A production-style PowerShell inventory reporting tool that collects system, disk, Windows service, and installed software information from multiple servers and exports results to CSV, HTML, and JSON.
+A production-style PowerShell inventory reporting tool that collects system, disk, Windows service, installed software, and network configuration information from multiple servers and exports results to CSV, HTML, and JSON.
 
 ## Overview
 
 **PowerShell Server Inventory Report** is designed for System Administrators who need a quick, repeatable way to document server hardware, operating system details, and disk usage across one or many systems. The script uses CIM/WMI for remote collection, evaluates server and disk health, and exports professional reports suitable for audits, change records, and portfolio demonstrations.
 
-**Current Version: v1.5**
+**Current Version: v1.6**
 
 ## Features
 
@@ -65,9 +65,21 @@ A production-style PowerShell inventory reporting tool that collects system, dis
 - **Software CSV Export** — `RecordType: Software` rows in `InventoryReport.csv`
 - **Software Filtering** — Optional `-SoftwareFilter` parameter for CSV, HTML, and JSON exports
 
+### Network Inventory (v1.6)
+
+- **Network Inventory** — Collects active physical and virtual network adapter configuration
+- **Network Health Monitoring** — Healthy / Warning / Critical evaluation per adapter and server
+- **DHCP Detection** — Reports DHCP-enabled vs static IP adapters
+- **DNS Inventory** — Collects configured DNS servers per adapter
+- **Gateway Inventory** — Reports default gateway per adapter
+- **Adapter Status Monitoring** — Up, Disconnected, and Disabled adapter states
+- **Network JSON Export** — `networkSummary` and `networks` in `InventoryReport.json`
+- **Network CSV Export** — `RecordType: Network` rows in `InventoryReport.csv`
+- **Network Filtering** — Optional `-NetworkFilter` parameter for CSV, HTML, and JSON exports
+
 ## Architecture
 
-The collector gathers four inventory layers per server:
+The collector gathers five inventory layers per server:
 
 | Layer | Data Collected |
 |-------|----------------|
@@ -75,6 +87,7 @@ The collector gathers four inventory layers per server:
 | **Disks** | Drive letter, size, free space, free percent, disk health status |
 | **Services** | Service name, display name, status, start type, service health status |
 | **Software** | Display name, version, publisher, install date, estimated size |
+| **Network** | Adapter name, status, MAC, IP, subnet, gateway, DNS, DHCP, link speed |
 
 ### Export Formats
 
@@ -124,15 +137,25 @@ Configurable in `ServerInventoryReport.ps1` via `$MonitoredServices`:
 
 WinRM, W32Time, EventLog, LanmanServer, LanmanWorkstation, Spooler, Dhcp, Dnscache, RemoteRegistry, Schedule, BITS
 
+### Network Health Rules
+
+| Condition | Health Status |
+|-----------|---------------|
+| Adapter status is Up | **Healthy** |
+| Adapter status is Disconnected or Disabled | **Warning** |
+| No active adapter with an IP address detected | **Critical** |
+
+Server-level network health (`networkHealthStatus`) is evaluated from all collected adapters. If no adapter is Up with an IP address, the server network status is **Critical**. If any adapter is disconnected while at least one active IP exists, status is **Warning**. Otherwise, network health is **Healthy**.
+
 ### Server Health Rules
 
-Server status uses the most severe result from disks and services:
+Server status uses the most severe result from disks, services, and network health:
 
 | Condition | Server Status |
 |-----------|---------------|
-| Any disk or service is Critical | **Critical** |
-| Any disk or service is Warning (no Critical) | **Warning** |
-| All disks and services Healthy | **Healthy** |
+| Any disk, service, or network health is Critical | **Critical** |
+| Any disk, service, or network health is Warning (no Critical) | **Warning** |
+| All disks, services, and network health are Healthy | **Healthy** |
 | Server cannot be reached | **Unreachable** |
 
 ## Requirements
@@ -164,6 +187,7 @@ Server status uses the most severe result from disks and services:
    .\ServerInventoryReport.ps1 -OutputPath 'C:\Reports'
    .\ServerInventoryReport.ps1 -ServerListFile '.\my-servers.txt'
    .\ServerInventoryReport.ps1 -SoftwareFilter 'VMware'
+   .\ServerInventoryReport.ps1 -NetworkFilter 'Wi-Fi'
    ```
 
 ### Software Filtering
@@ -176,6 +200,17 @@ Use `-SoftwareFilter` to limit exported software in CSV, HTML, and JSON:
 ```
 
 Inventory collection still runs for all software; the filter applies to export output only.
+
+### Network Filtering
+
+Use `-NetworkFilter` to limit exported network adapters in CSV, HTML, and JSON:
+
+```powershell
+.\ServerInventoryReport.ps1 -NetworkFilter "Wi-Fi"
+.\ServerInventoryReport.ps1 -NetworkFilter "Ethernet"
+```
+
+Inventory collection still runs for all adapters; the filter applies to export output only.
 
 6. Open the generated files:
 
@@ -208,6 +243,10 @@ TotalServices    : 11
 HealthyServices  : 9
 WarningServices  : 2
 CriticalServices : 1
+TotalAdapters    : 4
+ConnectedAdapters: 2
+DhcpEnabledAdapters: 1
+StaticIpAdapters : 1
 
 Service Summary
 ---------------
@@ -219,6 +258,18 @@ Critical Services Detected
 ----------------------------
 ComputerName ServiceName Status  StartType HealthStatus
 DRAGON       WinRM       Stopped Automatic Critical
+
+Network Summary
+---------------
+Total Adapters        : 4
+Connected Adapters    : 2
+Disconnected Adapters : 2
+DHCP Enabled          : 1
+Static IP             : 1
+
+Network Information
+ComputerName AdapterName Status IPAddress    Gateway     DHCP
+DRAGON       Wi-Fi       Up     192.168.1.25 192.168.1.1 True
 
 Server: DRAGON [Critical]
 ----------------------------------------
@@ -233,15 +284,15 @@ JSON report saved to: .\reports\InventoryReport.json
 
 | File | Description |
 |------|-------------|
-| `InventoryReport.csv` | All server, disk, service, and software records (RecordType: Server / Disk / Service / Software) |
-| `InventoryReport.html` | Multi-server dashboard with server, disk, service, and software sections |
+| `InventoryReport.csv` | All server, disk, service, software, and network records (RecordType: Server / Disk / Service / Software / Network) |
+| `InventoryReport.html` | Multi-server dashboard with server, disk, service, software, and network sections |
 | `InventoryReport.json` | Structured JSON for InfraOps Dashboard and automation integration |
 
 ### JSON Structure
 
 ```json
 {
-  "reportVersion": "v1.5",
+  "reportVersion": "v1.6",
   "generatedAt": "2026-06-07T19:30:00",
   "generatedBy": "ServerInventoryReport.ps1",
   "serverSummary": {
@@ -259,6 +310,13 @@ JSON report saved to: .\reports\InventoryReport.json
     "warningServices": 2,
     "criticalServices": 1,
     "totalSoftwarePackages": 124
+  },
+  "networkSummary": {
+    "totalAdapters": 4,
+    "connectedAdapters": 2,
+    "disconnectedAdapters": 2,
+    "dhcpEnabledAdapters": 1,
+    "staticIpAdapters": 1
   },
   "servers": [
     {
@@ -298,6 +356,16 @@ JSON report saved to: .\reports\InventoryReport.json
       "estimatedSizeMB": 412
     }
   ],
+  "networks": [
+    {
+      "computerName": "DRAGON",
+      "adapterName": "Wi-Fi",
+      "status": "Up",
+      "ipAddress": "192.168.1.25",
+      "defaultGateway": "192.168.1.1",
+      "dhcpEnabled": true
+    }
+  ],
   "failedServers": []
 }
 ```
@@ -313,6 +381,7 @@ Add screenshots of the HTML report to the `screenshots` folder for documentation
 - PowerShell
 - WMI / CIM (`Get-CimInstance`)
 - Storage cmdlets (`Get-Volume` for local disks)
+- Network cmdlets (`Get-NetAdapter`, `Get-NetIPConfiguration`, `Get-NetIPInterface`)
 - Service cmdlets (`Get-Service`, `Win32_Service` via CIM)
 - Windows Registry (`Get-ItemProperty`, `StdRegProv` via CIM for remote)
 - `Export-Csv`, `ConvertTo-Json`, and custom HTML generation
@@ -327,13 +396,13 @@ Add screenshots of the HTML report to the `screenshots` folder for documentation
 | **v1.3** | JSON export — InfraOps Dashboard integration, machine-readable collector output |
 | **v1.4** | Windows services inventory — service health monitoring, critical service detection, service exports |
 | **v1.5** | Installed software inventory — software asset reporting, publisher summary, software filtering |
+| **v1.6** | Network inventory — adapter configuration, network health monitoring, DHCP/DNS/gateway reporting, network exports |
 
 ## Future Enhancements
 
 - InfraOps Dashboard web application integration
 - Credential parameter for remote authentication
 - Scheduled task deployment guide
-- Network adapter and IP address reporting
 - Installed software and Windows Update status
 - Email report delivery option
 - Azure VM inventory integration

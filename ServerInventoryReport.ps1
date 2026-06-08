@@ -5,12 +5,12 @@
     Generates a multi-server inventory report and exports results to CSV, HTML, and JSON.
 
 .DESCRIPTION
-    PowerShell Server Inventory Report v1.5
+    PowerShell Server Inventory Report v1.6
     Reads server names from servers.txt and collects system, hardware, BIOS,
-    CPU, uptime, disk, Windows service, and installed software information
-    from each target using CIM/WMI and registry queries. Exports a combined
-    inventory report to CSV, a dashboard-style HTML report, and a JSON report
-    for InfraOps Dashboard integration.
+    CPU, uptime, disk, Windows service, installed software, and network
+    configuration information from each target. Exports a combined inventory
+    report to CSV, a dashboard-style HTML report, and a JSON report for
+    InfraOps Dashboard integration.
 
 .PARAMETER OutputPath
     Directory where InventoryReport.csv, InventoryReport.html, and InventoryReport.json will be saved.
@@ -35,22 +35,31 @@
     .\ServerInventoryReport.ps1 -SoftwareFilter 'VMware'
     Filters software results in CSV, HTML, and JSON exports to VMware-related entries.
 
+.EXAMPLE
+    .\ServerInventoryReport.ps1 -NetworkFilter 'Wi-Fi'
+    Filters network results in CSV, HTML, and JSON exports to matching adapters.
+
 .PARAMETER SoftwareFilter
     Optional filter applied to exported software results. Matches display name or publisher.
     Inventory collection still runs for all software; filtering applies to exports only.
+
+.PARAMETER NetworkFilter
+    Optional filter applied to exported network results. Matches adapter name or description.
+    Inventory collection still runs for all adapters; filtering applies to exports only.
 #>
 
 [CmdletBinding()]
 param(
     [string]$OutputPath,
     [string]$ServerListFile,
-    [string]$SoftwareFilter
+    [string]$SoftwareFilter,
+    [string]$NetworkFilter
 )
 
 # Variables
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion    = 'v1.5'
+$ScriptVersion    = 'v1.6'
 $ReportScriptName = 'ServerInventoryReport.ps1'
 
 $SoftwareRegistryPaths = @(
@@ -192,7 +201,7 @@ function Get-ServiceHealthStatus {
 function Get-CombinedServerHealthStatus {
     <#
     .SYNOPSIS
-        Determines overall server health from disk and service health statuses.
+        Determines overall server health from disk, service, and network health statuses.
     #>
     param(
         [Parameter(Mandatory)]
@@ -201,10 +210,14 @@ function Get-CombinedServerHealthStatus {
 
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [string[]]$ServiceHealthStatuses
+        [string[]]$ServiceHealthStatuses,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$NetworkHealthStatuses
     )
 
-    $AllStatuses = @($DiskStatuses) + @($ServiceHealthStatuses)
+    $AllStatuses = @($DiskStatuses) + @($ServiceHealthStatuses) + @($NetworkHealthStatuses)
 
     if ($AllStatuses -contains 'Critical') {
         return 'Critical'
@@ -340,7 +353,6 @@ function Get-CleanSoftwareInventory {
         Returns meaningful installed applications by excluding noisy registry entries.
     #>
     param(
-        [Parameter(Mandatory)]
         [array]$Software
     )
 
@@ -352,7 +364,6 @@ function Get-CleanSoftwareInventory {
 
 function Get-FilteredSoftwareInventory {
     param(
-        [Parameter(Mandatory)]
         [array]$Software,
 
         [string]$Filter
@@ -370,7 +381,6 @@ function Get-FilteredSoftwareInventory {
 
 function Get-SoftwareSummary {
     param(
-        [Parameter(Mandatory)]
         [array]$Software
     )
 
@@ -568,6 +578,357 @@ function Get-SoftwareInventory {
     }
 }
 
+function Get-FirstNetworkValue {
+    param(
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    return [string](@($Value) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+}
+
+function Format-NetworkMacAddress {
+    param(
+        [string]$MacAddress
+    )
+
+    if ([string]::IsNullOrWhiteSpace($MacAddress)) {
+        return ''
+    }
+
+    $CleanMac = ($MacAddress -replace '[^0-9A-Fa-f]', '').ToUpper()
+
+    if ($CleanMac.Length -ne 12) {
+        return $MacAddress
+    }
+
+    return ($CleanMac -replace '(.{2})(?=.)', '$1-')
+}
+
+function Convert-PrefixLengthToSubnetMask {
+    param(
+        [int]$PrefixLength
+    )
+
+    if ($PrefixLength -le 0 -or $PrefixLength -gt 32) {
+        return ''
+    }
+
+    $Mask = [uint32]0
+    for ($i = 0; $i -lt $PrefixLength; $i++) {
+        $Mask = $Mask -bor [uint32](1 -shl (31 - $i))
+    }
+
+    $Bytes = [BitConverter]::GetBytes($Mask)
+    if ([BitConverter]::IsLittleEndian) {
+        [array]::Reverse($Bytes)
+    }
+
+    return ([System.Net.IPAddress]$Bytes).ToString()
+}
+
+function Convert-LinkSpeedToMbps {
+    param(
+        $LinkSpeed
+    )
+
+    if ($null -eq $LinkSpeed) {
+        return 0
+    }
+
+    if ($LinkSpeed -is [array]) {
+        $LinkSpeed = ($LinkSpeed | Where-Object { $_ } | Select-Object -First 1)
+    }
+
+    if (-not $LinkSpeed -or ($LinkSpeed -is [int] -and $LinkSpeed -lt 0)) {
+        return 0
+    }
+
+    try {
+        return [math]::Round([uint64]$LinkSpeed / 1000000, 0)
+    }
+    catch {
+        return 0
+    }
+}
+
+function Get-AdapterNetworkHealthStatus {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Status
+    )
+
+    switch ($Status) {
+        'Up' { return 'Healthy' }
+        'Disconnected' { return 'Warning' }
+        'Disabled' { return 'Warning' }
+        default { return 'Warning' }
+    }
+}
+
+function Get-ServerNetworkHealthStatus {
+    <#
+    .SYNOPSIS
+        Determines server-level network health from adapter inventory.
+    #>
+    param(
+        [array]$Networks
+    )
+
+    $ActiveWithIp = @($Networks | Where-Object {
+            $_.Status -eq 'Up' -and -not [string]::IsNullOrWhiteSpace($_.IPAddress)
+        })
+
+    if (-not $ActiveWithIp) {
+        return 'Critical'
+    }
+
+    if (@($Networks | Where-Object { $_.Status -in @('Disconnected', 'Disabled') }).Count -gt 0) {
+        return 'Warning'
+    }
+
+    return 'Healthy'
+}
+
+function Get-FilteredNetworkInventory {
+    param(
+        [array]$Networks,
+
+        [string]$Filter
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Filter)) {
+        return $Networks
+    }
+
+    return @($Networks | Where-Object {
+            $_.AdapterName -like "*$Filter*" -or
+            $_.InterfaceDescription -like "*$Filter*"
+        })
+}
+
+function Get-NetworkSummary {
+    param(
+        [array]$Networks
+    )
+
+    $Connected = @($Networks | Where-Object { $_.Status -eq 'Up' }).Count
+    $Disconnected = @($Networks | Where-Object { $_.Status -in @('Disconnected', 'Disabled') }).Count
+    $DhcpEnabled = @($Networks | Where-Object { $_.DhcpEnabled -eq $true }).Count
+    $StaticIp = @($Networks | Where-Object {
+            $_.Status -eq 'Up' -and
+            -not [string]::IsNullOrWhiteSpace($_.IPAddress) -and
+            $_.DhcpEnabled -eq $false
+        }).Count
+
+    return [PSCustomObject]@{
+        TotalAdapters        = $Networks.Count
+        ConnectedAdapters    = $Connected
+        DisconnectedAdapters = $Disconnected
+        DhcpEnabledAdapters  = $DhcpEnabled
+        StaticIpAdapters     = $StaticIp
+    }
+}
+
+function Get-NetworkInventoryFromCmdlets {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+
+        $CimSession
+    )
+
+    $CmdletParams = @{}
+    if ($CimSession) {
+        $CmdletParams['CimSession'] = $CimSession
+    }
+
+    $Adapters = @(Get-NetAdapter @CmdletParams -ErrorAction Stop |
+        Where-Object {
+            $_.InterfaceDescription -notlike '*Loopback*' -and
+            $_.InterfaceDescription -notlike '*Teredo*' -and
+            $_.InterfaceDescription -notlike '*isatap*' -and
+            $_.Name -notlike '*Bluetooth*'
+        })
+
+    $NetworkInventory = foreach ($Adapter in $Adapters) {
+        $IpConfig = Get-NetIPConfiguration -InterfaceIndex $Adapter.InterfaceIndex @CmdletParams -ErrorAction SilentlyContinue
+        $Ipv4     = $IpConfig.IPv4Address | Select-Object -First 1
+
+        $IpAddress  = if ($Ipv4) { Get-FirstNetworkValue -Value $Ipv4.IPAddress } else { '' }
+        $SubnetMask = if ($Ipv4 -and $Ipv4.PrefixLength -gt 0 -and $Ipv4.PrefixLength -le 32) {
+            Convert-PrefixLengthToSubnetMask -PrefixLength $Ipv4.PrefixLength
+        }
+        else { '' }
+        $Gateway = if ($IpConfig -and $IpConfig.IPv4DefaultGateway) {
+            Get-FirstNetworkValue -Value $IpConfig.IPv4DefaultGateway.NextHop
+        }
+        else { '' }
+        $DnsServers = if ($IpConfig -and $IpConfig.DNSServer) {
+            @($IpConfig.DNSServer.ServerAddresses | Where-Object { $_ })
+        }
+        else { @() }
+        $IpInterface = Get-NetIPInterface -InterfaceIndex $Adapter.InterfaceIndex -AddressFamily IPv4 @CmdletParams -ErrorAction SilentlyContinue
+        $DhcpEnabled = if ($IpInterface) { $IpInterface.Dhcp -eq 'Enabled' } else { $false }
+
+        $AdapterStatus = [string]$Adapter.Status
+
+        [PSCustomObject]@{
+            ComputerName         = $ComputerName
+            AdapterName          = $Adapter.Name
+            InterfaceDescription = $Adapter.InterfaceDescription
+            Status               = $AdapterStatus
+            MACAddress           = Format-NetworkMacAddress -MacAddress $Adapter.MacAddress
+            IPAddress            = $IpAddress
+            SubnetMask           = $SubnetMask
+            DefaultGateway       = $Gateway
+            DnsServers           = $DnsServers
+            DnsServersDisplay    = ($DnsServers -join ', ')
+            DhcpEnabled          = $DhcpEnabled
+            LinkSpeedMbps        = Convert-LinkSpeedToMbps -LinkSpeed $Adapter.LinkSpeed
+            HealthStatus         = Get-AdapterNetworkHealthStatus -Status $AdapterStatus
+        }
+    }
+
+    return @($NetworkInventory)
+}
+
+function Get-NetworkInventoryFromCim {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ServerName,
+
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+
+        [bool]$IsLocal
+    )
+
+    $CimParams = @{}
+    if (-not $IsLocal) {
+        $CimParams['ComputerName'] = $ServerName
+    }
+
+    $Adapters = @(Get-CimInstance -ClassName Win32_NetworkAdapter @CimParams -ErrorAction Stop |
+        Where-Object {
+            $_.PhysicalAdapter -or $_.AdapterType -eq 0
+        } |
+        Where-Object {
+            $_.NetConnectionID -and
+            $_.Name -notlike '*Bluetooth*'
+        })
+
+    $Configs = @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration @CimParams -ErrorAction Stop)
+    $NetworkInventory = @()
+
+    foreach ($Adapter in $Adapters) {
+        $Config = $Configs | Where-Object Index -eq $Adapter.Index | Select-Object -First 1
+
+        $IpAddress  = ''
+        $SubnetMask = ''
+        $Gateway    = ''
+        $DnsServers = @()
+        $DhcpEnabled = $false
+
+        if ($Config) {
+            $IpAddress   = Get-FirstNetworkValue -Value @($Config.IPAddress | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })
+            $SubnetMask  = Get-FirstNetworkValue -Value @($Config.IPSubnet | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })
+            $Gateway     = Get-FirstNetworkValue -Value $Config.DefaultIPGateway
+            $DnsServers  = @($Config.DNSServerSearchOrder | Where-Object { $_ })
+            $DhcpEnabled = [bool]$Config.DHCPEnabled
+        }
+
+        $AdapterStatus = if ($Adapter.NetEnabled) { 'Up' } else { 'Disconnected' }
+
+        $NetworkInventory += [PSCustomObject]@{
+            ComputerName         = $ComputerName
+            AdapterName          = $Adapter.NetConnectionID
+            InterfaceDescription = $Adapter.Name
+            Status               = $AdapterStatus
+            MACAddress           = Format-NetworkMacAddress -MacAddress $Adapter.MACAddress
+            IPAddress            = $IpAddress
+            SubnetMask           = $SubnetMask
+            DefaultGateway       = $Gateway
+            DnsServers           = $DnsServers
+            DnsServersDisplay    = ($DnsServers -join ', ')
+            DhcpEnabled          = $DhcpEnabled
+            LinkSpeedMbps        = if ($Adapter.Speed -and $Adapter.Speed -gt 0) { [math]::Round($Adapter.Speed / 1000000, 0) } else { 0 }
+            HealthStatus         = Get-AdapterNetworkHealthStatus -Status $AdapterStatus
+        }
+    }
+
+    return $NetworkInventory
+}
+
+function Get-NetworkInventory {
+    <#
+    .SYNOPSIS
+        Collects network adapter configuration for a server.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ServerName,
+
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory)]
+        [bool]$IsLocal
+    )
+
+    $CimSession = $null
+
+    try {
+        if (-not $IsLocal) {
+            $CimSession = New-CimSession -ComputerName $ServerName -ErrorAction Stop
+            return @(Get-NetworkInventoryFromCmdlets -ComputerName $ComputerName -CimSession $CimSession)
+        }
+
+        return @(Get-NetworkInventoryFromCmdlets -ComputerName $ComputerName)
+    }
+    catch {
+        Write-Verbose "Network cmdlet collection failed for '$ServerName'. Falling back to CIM. $($_.Exception.Message)"
+
+        try {
+            return @(Get-NetworkInventoryFromCim -ServerName $ServerName -ComputerName $ComputerName -IsLocal $IsLocal)
+        }
+        catch {
+            Write-Verbose "Unable to collect network inventory for '$ServerName': $($_.Exception.Message)"
+            return @()
+        }
+    }
+    finally {
+        if ($CimSession) {
+            Remove-CimSession -CimSession $CimSession -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Write-NetworkConsoleTable {
+    param(
+        [array]$Networks
+    )
+
+    if (-not $Networks) {
+        return
+    }
+
+    $Networks |
+        Select-Object `
+            @{Name = 'ComputerName'; Expression = { $_.ComputerName } }, `
+            @{Name = 'AdapterName';  Expression = { $_.AdapterName } }, `
+            @{Name = 'Status';       Expression = { $_.Status } }, `
+            @{Name = 'IPAddress';    Expression = { $_.IPAddress } }, `
+            @{Name = 'Gateway';      Expression = { $_.DefaultGateway } }, `
+            @{Name = 'DHCP';         Expression = { $_.DhcpEnabled } } |
+        Format-Table -Property ComputerName, AdapterName, Status, IPAddress, Gateway, DHCP -AutoSize |
+        Out-String -Width 250 |
+        ForEach-Object { Write-Host $_ }
+}
+
 function Get-ServiceInventory {
     <#
     .SYNOPSIS
@@ -720,15 +1081,30 @@ function Get-ServerInventory {
             -ComputerName $SystemInventory.ComputerName `
             -IsLocal $IsLocal)
 
+        try {
+            $NetworkInventory = @(Get-NetworkInventory `
+                -ServerName $ServerName `
+                -ComputerName $SystemInventory.ComputerName `
+                -IsLocal $IsLocal)
+        }
+        catch {
+            Write-Verbose "Network inventory collection failed for '$ServerName': $($_.Exception.Message)"
+            $NetworkInventory = @()
+        }
+
+        $NetworkHealthStatus = Get-ServerNetworkHealthStatus -Networks $NetworkInventory
+
         $SystemInventory.ServerStatus = Get-CombinedServerHealthStatus `
             -DiskStatuses @($DiskInventory.Status) `
-            -ServiceHealthStatuses @($ServiceInventory.HealthStatus)
+            -ServiceHealthStatuses @($ServiceInventory.HealthStatus) `
+            -NetworkHealthStatuses @($NetworkHealthStatus)
 
         return [PSCustomObject]@{
             System   = $SystemInventory
             Disks    = $DiskInventory
             Services = $ServiceInventory
             Software = $SoftwareInventory
+            Networks = $NetworkInventory
         }
     }
     catch {
@@ -754,13 +1130,13 @@ function Get-ServerInventory {
             Disks    = @()
             Services = @()
             Software = @()
+            Networks = @()
         }
     }
 }
 
 function Get-HtmlServerStatusTable {
     param(
-        [Parameter(Mandatory)]
         [array]$Servers
     )
 
@@ -811,7 +1187,6 @@ function Get-HtmlServerStatusTable {
 
 function Get-HtmlDiskDetailsTable {
     param(
-        [Parameter(Mandatory)]
         [array]$Disks
     )
 
@@ -854,7 +1229,6 @@ function Get-HtmlDiskDetailsTable {
 
 function Get-HtmlServiceDetailsTable {
     param(
-        [Parameter(Mandatory)]
         [array]$Services
     )
 
@@ -897,7 +1271,6 @@ function Get-HtmlServiceDetailsTable {
 
 function Get-HtmlSoftwareDetailsTable {
     param(
-        [Parameter(Mandatory)]
         [array]$Software
     )
 
@@ -937,6 +1310,57 @@ function Get-HtmlSoftwareDetailsTable {
 "@
 }
 
+function Get-HtmlNetworkDetailsTable {
+    param(
+        [array]$Networks
+    )
+
+    if (-not $Networks) {
+        return '<p class="no-data">No network information available.</p>'
+    }
+
+    $HtmlRows = foreach ($Network in $Networks) {
+        $StatusClass = Get-StatusCssClass -Status $Network.HealthStatus
+        $DhcpDisplay = if ($Network.DhcpEnabled) { 'Yes' } else { 'No' }
+        @"
+        <tr>
+            <td>$($Network.ComputerName)</td>
+            <td>$($Network.AdapterName)</td>
+            <td><span class="status-badge $StatusClass">$($Network.Status)</span></td>
+            <td>$($Network.IPAddress)</td>
+            <td>$($Network.SubnetMask)</td>
+            <td>$($Network.DefaultGateway)</td>
+            <td>$($Network.DnsServersDisplay)</td>
+            <td>$DhcpDisplay</td>
+            <td>$($Network.LinkSpeedMbps) Mbps</td>
+        </tr>
+"@
+    }
+
+    return @"
+<div class="software-table-wrapper">
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Computer</th>
+            <th>Adapter</th>
+            <th>Status</th>
+            <th>IP Address</th>
+            <th>Subnet Mask</th>
+            <th>Gateway</th>
+            <th>DNS Servers</th>
+            <th>DHCP</th>
+            <th>Link Speed</th>
+        </tr>
+    </thead>
+    <tbody>
+        $($HtmlRows -join "`n")
+    </tbody>
+</table>
+</div>
+"@
+}
+
 function Export-InventoryJson {
     <#
     .SYNOPSIS
@@ -955,18 +1379,30 @@ function Export-InventoryJson {
         [Parameter(Mandatory)]
         [object]$Summary,
 
-        [Parameter(Mandatory)]
-        [array]$Servers,
+        [AllowEmptyCollection()]
+        $Servers,
+
+        [AllowEmptyCollection()]
+        $Disks,
+
+        [AllowEmptyCollection()]
+        $Services,
+
+        [AllowEmptyCollection()]
+        $Software,
+
+        [AllowEmptyCollection()]
+        $Networks,
 
         [Parameter(Mandatory)]
-        [array]$Disks,
-
-        [Parameter(Mandatory)]
-        [array]$Services,
-
-        [Parameter(Mandatory)]
-        [array]$Software
+        [object]$NetworkSummary
     )
+
+    $Servers  = @($Servers)
+    $Disks    = @($Disks)
+    $Services = @($Services)
+    $Software = @($Software)
+    $Networks = @($Networks)
 
     $ReachableServers = @($Servers | Where-Object { $_.Reachable })
     $FailedServers    = @($Servers | Where-Object { -not $_.Reachable })
@@ -990,6 +1426,13 @@ function Export-InventoryJson {
             warningServices  = $Summary.WarningServices
             criticalServices      = $Summary.CriticalServices
             totalSoftwarePackages = $Summary.TotalSoftwarePackages
+        }
+        networkSummary = [ordered]@{
+            totalAdapters        = $NetworkSummary.TotalAdapters
+            connectedAdapters    = $NetworkSummary.ConnectedAdapters
+            disconnectedAdapters = $NetworkSummary.DisconnectedAdapters
+            dhcpEnabledAdapters  = $NetworkSummary.DhcpEnabledAdapters
+            staticIpAdapters     = $NetworkSummary.StaticIpAdapters
         }
         servers = @(
             foreach ($Server in $ReachableServers) {
@@ -1045,6 +1488,24 @@ function Export-InventoryJson {
                 }
             }
         )
+        networks = @(
+            foreach ($Network in $Networks) {
+                [ordered]@{
+                    computerName         = $Network.ComputerName
+                    adapterName          = $Network.AdapterName
+                    interfaceDescription = $Network.InterfaceDescription
+                    status               = $Network.Status
+                    macAddress           = $Network.MACAddress
+                    ipAddress            = $Network.IPAddress
+                    subnetMask           = $Network.SubnetMask
+                    defaultGateway       = $Network.DefaultGateway
+                    dnsServers           = @($Network.DnsServers)
+                    dhcpEnabled          = [bool]$Network.DhcpEnabled
+                    linkSpeedMbps        = [double]$Network.LinkSpeedMbps
+                    healthStatus         = $Network.HealthStatus
+                }
+            }
+        )
         failedServers = @(
             foreach ($Server in $FailedServers) {
                 [ordered]@{
@@ -1066,7 +1527,6 @@ function Write-ServiceConsoleTable {
         Writes service inventory to the console in a readable table format.
     #>
     param(
-        [Parameter(Mandatory)]
         [array]$Services
     )
 
@@ -1092,7 +1552,6 @@ function Write-DiskConsoleTable {
         Writes disk inventory to the console in a readable table format.
     #>
     param(
-        [Parameter(Mandatory)]
         [array]$Disks
     )
 
@@ -1293,12 +1752,15 @@ $InventoryResults = foreach ($ServerName in $ServerNames) {
 }
 
 $AllServers  = @($InventoryResults | ForEach-Object { $_.System })
-$AllDisks    = @($InventoryResults | ForEach-Object { $_.Disks })
-$AllServices = @($InventoryResults | ForEach-Object { $_.Services })
-$AllSoftware = @($InventoryResults | ForEach-Object { $_.Software })
+$AllDisks    = @(foreach ($Result in $InventoryResults) { foreach ($Disk in @($Result.Disks)) { $Disk } })
+$AllServices = @(foreach ($Result in $InventoryResults) { foreach ($Service in @($Result.Services)) { $Service } })
+$AllSoftware = @(foreach ($Result in $InventoryResults) { foreach ($App in @($Result.Software)) { $App } })
+$AllNetworks = @(foreach ($Result in $InventoryResults) { foreach ($Network in @($Result.Networks)) { $Network } })
 
 $ExportSoftware = @(Get-FilteredSoftwareInventory -Software $AllSoftware -Filter $SoftwareFilter)
+$ExportNetworks = @(Get-FilteredNetworkInventory -Networks $AllNetworks -Filter $NetworkFilter)
 $SoftwareSummary = Get-SoftwareSummary -Software $ExportSoftware
+$NetworkSummary  = Get-NetworkSummary -Networks $ExportNetworks
 
 # Dashboard Summary
 
@@ -1318,6 +1780,11 @@ $ServerSummary = [PSCustomObject]@{
     CriticalServices      = @($AllServices | Where-Object HealthStatus -eq 'Critical').Count
     TotalSoftwarePackages = $SoftwareSummary.TotalSoftwarePackages
     TopSoftwarePublisher  = $SoftwareSummary.TopPublisher
+    TotalAdapters         = $NetworkSummary.TotalAdapters
+    ConnectedAdapters     = $NetworkSummary.ConnectedAdapters
+    DisconnectedAdapters  = $NetworkSummary.DisconnectedAdapters
+    DhcpEnabledAdapters   = $NetworkSummary.DhcpEnabledAdapters
+    StaticIpAdapters      = $NetworkSummary.StaticIpAdapters
 }
 
 # Export Reports
@@ -1348,6 +1815,15 @@ try {
             EstimatedSizeMB = ''
             ServiceStatus   = ''
             StartType       = ''
+            AdapterName          = ''
+            InterfaceDescription = ''
+            MacAddress           = ''
+            IPAddress            = ''
+            SubnetMask           = ''
+            DefaultGateway       = ''
+            DnsServers           = ''
+            DhcpEnabled          = ''
+            LinkSpeedMbps        = ''
             DriveLetter     = ''
             TotalSizeGB     = ''
             FreeSpaceGB     = ''
@@ -1380,6 +1856,15 @@ try {
             EstimatedSizeMB = ''
             ServiceStatus   = ''
             StartType       = ''
+            AdapterName          = ''
+            InterfaceDescription = ''
+            MacAddress           = ''
+            IPAddress            = ''
+            SubnetMask           = ''
+            DefaultGateway       = ''
+            DnsServers           = ''
+            DhcpEnabled          = ''
+            LinkSpeedMbps        = ''
             DriveLetter     = $Disk.DriveLetter
             TotalSizeGB     = $Disk.TotalSizeGB
             FreeSpaceGB     = $Disk.FreeSpaceGB
@@ -1412,6 +1897,15 @@ try {
             EstimatedSizeMB = ''
             ServiceStatus   = $Service.Status
             StartType       = $Service.StartType
+            AdapterName          = ''
+            InterfaceDescription = ''
+            MacAddress           = ''
+            IPAddress            = ''
+            SubnetMask           = ''
+            DefaultGateway       = ''
+            DnsServers           = ''
+            DhcpEnabled          = ''
+            LinkSpeedMbps        = ''
             DriveLetter     = ''
             TotalSizeGB     = ''
             FreeSpaceGB     = ''
@@ -1444,12 +1938,62 @@ try {
             EstimatedSizeMB = $App.EstimatedSizeMB
             ServiceStatus   = ''
             StartType       = ''
+            AdapterName          = ''
+            InterfaceDescription = ''
+            MacAddress           = ''
+            IPAddress            = ''
+            SubnetMask           = ''
+            DefaultGateway       = ''
+            DnsServers           = ''
+            DhcpEnabled          = ''
+            LinkSpeedMbps        = ''
             DriveLetter     = ''
             TotalSizeGB     = ''
             FreeSpaceGB     = ''
             FreePercent     = ''
             Status          = ''
             HealthStatus    = ''
+        }
+    }
+
+    foreach ($Network in $ExportNetworks) {
+        $CsvExport += [PSCustomObject]@{
+            RecordType           = 'Network'
+            ServerName           = $Network.ComputerName
+            ComputerName         = $Network.ComputerName
+            OperatingSystem      = ''
+            OSVersion            = ''
+            Manufacturer         = ''
+            Model                = ''
+            TotalRAMGB           = ''
+            FreeRAMGB            = ''
+            BIOSVersion          = ''
+            SerialNumber         = ''
+            CPUName              = ''
+            SystemUptime         = ''
+            ServiceName          = ''
+            DisplayName          = ''
+            DisplayVersion       = ''
+            Publisher            = ''
+            InstallDate          = ''
+            EstimatedSizeMB      = ''
+            ServiceStatus        = ''
+            StartType            = ''
+            AdapterName          = $Network.AdapterName
+            InterfaceDescription = $Network.InterfaceDescription
+            MacAddress           = $Network.MACAddress
+            IPAddress            = $Network.IPAddress
+            SubnetMask           = $Network.SubnetMask
+            DefaultGateway       = $Network.DefaultGateway
+            DnsServers           = $Network.DnsServersDisplay
+            DhcpEnabled          = $Network.DhcpEnabled
+            LinkSpeedMbps        = $Network.LinkSpeedMbps
+            DriveLetter          = ''
+            TotalSizeGB          = ''
+            FreeSpaceGB          = ''
+            FreePercent          = ''
+            Status               = $Network.Status
+            HealthStatus         = $Network.HealthStatus
         }
     }
 
@@ -1464,6 +2008,7 @@ try {
     $DiskHtml     = Get-HtmlDiskDetailsTable -Disks $AllDisks
     $ServiceHtml  = Get-HtmlServiceDetailsTable -Services $AllServices
     $SoftwareHtml = Get-HtmlSoftwareDetailsTable -Software $ExportSoftware
+    $NetworkHtml  = Get-HtmlNetworkDetailsTable -Networks $ExportNetworks
     $TopPublisherDisplay = if ($ServerSummary.TopSoftwarePublisher) { $ServerSummary.TopSoftwarePublisher } else { 'N/A' }
 
     $HtmlReport = @"
@@ -1567,6 +2112,35 @@ $(Get-HtmlStyles)
         <h2>Software Inventory</h2>
         $SoftwareHtml
 
+        <div class="summary-panel">
+            <h2>Network Inventory Summary</h2>
+            <div class="summary-grid">
+                <div class="summary-card">
+                    <div class="label">Total Adapters</div>
+                    <div class="value">$($ServerSummary.TotalAdapters)</div>
+                </div>
+                <div class="summary-card healthy">
+                    <div class="label">Connected</div>
+                    <div class="value">$($ServerSummary.ConnectedAdapters)</div>
+                </div>
+                <div class="summary-card warning">
+                    <div class="label">Disconnected</div>
+                    <div class="value">$($ServerSummary.DisconnectedAdapters)</div>
+                </div>
+                <div class="summary-card">
+                    <div class="label">DHCP Enabled</div>
+                    <div class="value">$($ServerSummary.DhcpEnabledAdapters)</div>
+                </div>
+                <div class="summary-card">
+                    <div class="label">Static IP</div>
+                    <div class="value">$($ServerSummary.StaticIpAdapters)</div>
+                </div>
+            </div>
+        </div>
+
+        <h2>Network Inventory</h2>
+        $NetworkHtml
+
         <div class="footer">
             <p>PowerShell Server Inventory Report $ScriptVersion</p>
             <p><strong>Generated By:</strong> $ReportScriptName</p>
@@ -1590,7 +2164,9 @@ $(Get-HtmlStyles)
         -Servers $AllServers `
         -Disks $AllDisks `
         -Services $AllServices `
-        -Software $ExportSoftware
+        -Software $ExportSoftware `
+        -Networks $ExportNetworks `
+        -NetworkSummary $NetworkSummary
 }
 catch {
     Write-Error "Unable to export inventory reports. $_"
@@ -1645,6 +2221,20 @@ if ($SoftwareFilter) {
     Write-Host ''
 }
 
+Write-Host 'Network Summary'
+Write-Host '---------------'
+Write-Host "Total Adapters        : $($NetworkSummary.TotalAdapters)"
+Write-Host "Connected Adapters    : $($NetworkSummary.ConnectedAdapters)"
+Write-Host "Disconnected Adapters : $($NetworkSummary.DisconnectedAdapters)"
+Write-Host "DHCP Enabled          : $($NetworkSummary.DhcpEnabledAdapters)"
+Write-Host "Static IP             : $($NetworkSummary.StaticIpAdapters)"
+Write-Host ''
+
+if ($NetworkFilter) {
+    Write-Host "Network Filter Applied : $NetworkFilter"
+    Write-Host ''
+}
+
 foreach ($Result in $InventoryResults) {
     $Server = $Result.System
 
@@ -1664,6 +2254,12 @@ foreach ($Result in $InventoryResults) {
         if ($Result.Services) {
             Write-Host 'Service Information'
             Write-ServiceConsoleTable -Services $Result.Services
+        }
+
+        if ($Result.Networks) {
+            Write-Host 'Network Information'
+            $FilteredServerNetworks = @(Get-FilteredNetworkInventory -Networks $Result.Networks -Filter $NetworkFilter)
+            Write-NetworkConsoleTable -Networks $FilteredServerNetworks
         }
     }
     else {
