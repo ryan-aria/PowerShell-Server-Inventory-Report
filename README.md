@@ -1,12 +1,12 @@
 # PowerShell Server Inventory Report
 
-A production-style PowerShell inventory reporting tool that collects system and disk information from multiple Windows servers and exports results to CSV, HTML, and JSON.
+A production-style PowerShell inventory reporting tool that collects system, disk, and Windows service information from multiple servers and exports results to CSV, HTML, and JSON.
 
 ## Overview
 
 **PowerShell Server Inventory Report** is designed for System Administrators who need a quick, repeatable way to document server hardware, operating system details, and disk usage across one or many systems. The script uses CIM/WMI for remote collection, evaluates server and disk health, and exports professional reports suitable for audits, change records, and portfolio demonstrations.
 
-**Current Version: v1.3**
+**Current Version: v1.4**
 
 ## Features
 
@@ -46,6 +46,33 @@ A production-style PowerShell inventory reporting tool that collects system and 
 - **Machine-Readable Output** — Includes server summary, server inventory, disk details, and failed server records
 - **API-Friendly Schema** — Consistent property names suitable for ingestion by web dashboards and automation pipelines
 
+### Windows Services Inventory (v1.4)
+
+- **Windows Services Inventory** — Monitors operationally important services per server
+- **Service Health Monitoring** — Healthy / Warning / Critical / Unknown evaluation
+- **Critical Service Detection** — Flags stopped automatic services as critical
+- **Service Health Dashboard** — HTML summary cards and service inventory table
+- **Service JSON Export** — `services` array in `InventoryReport.json`
+- **Service CSV Export** — `RecordType: Service` rows in `InventoryReport.csv`
+
+## Architecture
+
+The collector gathers three inventory layers per server:
+
+| Layer | Data Collected |
+|-------|----------------|
+| **Servers** | OS, hardware, BIOS, CPU, RAM, uptime, server health status |
+| **Disks** | Drive letter, size, free space, free percent, disk health status |
+| **Services** | Service name, display name, status, start type, service health status |
+
+### Export Formats
+
+| Format | Output File | Use Case |
+|--------|-------------|----------|
+| **CSV** | `InventoryReport.csv` | Spreadsheets, audits, data analysis |
+| **HTML** | `InventoryReport.html` | Human-readable dashboard reports |
+| **JSON** | `InventoryReport.json` | InfraOps Dashboard and automation pipelines |
+
 ## Server List Configuration
 
 Create or edit `servers.txt` in the project root:
@@ -71,13 +98,30 @@ Each disk is evaluated based on free space percentage (`FreePercent`):
 | 10% – 19.9% | **Warning** | Low free space — plan cleanup or expansion |
 | < 10% | **Critical** | Very low free space — immediate attention recommended |
 
+### Service Health Rules
+
+| Condition | Health Status |
+|-----------|---------------|
+| Service exists and is Running | **Healthy** |
+| Service exists, Stopped, StartType = Manual | **Warning** |
+| Service exists, Stopped, StartType = Automatic | **Critical** |
+| Service not found | **Unknown** |
+
+### Monitored Services
+
+Configurable in `ServerInventoryReport.ps1` via `$MonitoredServices`:
+
+WinRM, W32Time, EventLog, LanmanServer, LanmanWorkstation, Spooler, Dhcp, Dnscache, RemoteRegistry, Schedule, BITS
+
 ### Server Health Rules
+
+Server status uses the most severe result from disks and services:
 
 | Condition | Server Status |
 |-----------|---------------|
-| Any disk is Critical | **Critical** |
-| Any disk is Warning (no Critical) | **Warning** |
-| All disks Healthy | **Healthy** |
+| Any disk or service is Critical | **Critical** |
+| Any disk or service is Warning (no Critical) | **Warning** |
+| All disks and services Healthy | **Healthy** |
 | Server cannot be reached | **Unreachable** |
 
 ## Requirements
@@ -133,10 +177,25 @@ HealthyServers  : 1
 WarningServers  : 1
 CriticalServers : 1
 FailedServers   : 0
-TotalDrives     : 4
-HealthyDrives   : 2
-WarningDrives   : 1
-CriticalDrives  : 1
+TotalDrives      : 4
+HealthyDrives    : 2
+WarningDrives    : 1
+CriticalDrives   : 1
+TotalServices    : 11
+HealthyServices  : 9
+WarningServices  : 2
+CriticalServices : 1
+
+Service Summary
+---------------
+Healthy Services  : 9
+Warning Services  : 2
+Critical Services : 1
+
+Critical Services Detected
+----------------------------
+ComputerName ServiceName Status  StartType HealthStatus
+DRAGON       WinRM       Stopped Automatic Critical
 
 Server: DRAGON [Critical]
 ----------------------------------------
@@ -151,15 +210,15 @@ JSON report saved to: .\reports\InventoryReport.json
 
 | File | Description |
 |------|-------------|
-| `InventoryReport.csv` | All server and disk records (RecordType: Server / Disk) |
-| `InventoryReport.html` | Multi-server dashboard with summary, server status, and disk details |
+| `InventoryReport.csv` | All server, disk, and service records (RecordType: Server / Disk / Service) |
+| `InventoryReport.html` | Multi-server dashboard with server, disk, and service health sections |
 | `InventoryReport.json` | Structured JSON for InfraOps Dashboard and automation integration |
 
 ### JSON Structure
 
 ```json
 {
-  "reportVersion": "v1.3",
+  "reportVersion": "v1.4",
   "generatedAt": "2026-06-07T19:30:00",
   "generatedBy": "ServerInventoryReport.ps1",
   "serverSummary": {
@@ -171,7 +230,11 @@ JSON report saved to: .\reports\InventoryReport.json
     "totalDrives": 2,
     "healthyDrives": 0,
     "warningDrives": 1,
-    "criticalDrives": 1
+    "criticalDrives": 1,
+    "totalServices": 11,
+    "healthyServices": 9,
+    "warningServices": 2,
+    "criticalServices": 1
   },
   "servers": [
     {
@@ -191,6 +254,16 @@ JSON report saved to: .\reports\InventoryReport.json
       "status": "Critical"
     }
   ],
+  "services": [
+    {
+      "computerName": "DRAGON",
+      "serviceName": "WinRM",
+      "displayName": "Windows Remote Management",
+      "status": "Stopped",
+      "startType": "Automatic",
+      "healthStatus": "Critical"
+    }
+  ],
   "failedServers": []
 }
 ```
@@ -206,6 +279,7 @@ Add screenshots of the HTML report to the `screenshots` folder for documentation
 - PowerShell
 - WMI / CIM (`Get-CimInstance`)
 - Storage cmdlets (`Get-Volume` for local disks)
+- Service cmdlets (`Get-Service`, `Win32_Service` via CIM)
 - `Export-Csv`, `ConvertTo-Json`, and custom HTML generation
 
 ## Version History
@@ -216,6 +290,7 @@ Add screenshots of the HTML report to the `screenshots` folder for documentation
 | **v1.1** | Disk health dashboard — health status, color-coded HTML, summary section |
 | **v1.2** | Multi-server inventory — remote collection, server health evaluation, unreachable handling |
 | **v1.3** | JSON export — InfraOps Dashboard integration, machine-readable collector output |
+| **v1.4** | Windows services inventory — service health monitoring, critical service detection, service exports |
 
 ## Future Enhancements
 

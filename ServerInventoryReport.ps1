@@ -5,11 +5,11 @@
     Generates a multi-server inventory report and exports results to CSV, HTML, and JSON.
 
 .DESCRIPTION
-    PowerShell Server Inventory Report v1.3
+    PowerShell Server Inventory Report v1.4
     Reads server names from servers.txt and collects system, hardware, BIOS,
-    CPU, uptime, and disk information from each target using CIM/WMI.
-    Exports a combined inventory report to CSV, a dashboard-style HTML report,
-    and a JSON report for InfraOps Dashboard integration.
+    CPU, uptime, disk, and Windows service information from each target using
+    CIM/WMI. Exports a combined inventory report to CSV, a dashboard-style HTML
+    report, and a JSON report for InfraOps Dashboard integration.
 
 .PARAMETER OutputPath
     Directory where InventoryReport.csv, InventoryReport.html, and InventoryReport.json will be saved.
@@ -40,8 +40,22 @@ param(
 # Variables
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion    = 'v1.3'
+$ScriptVersion    = 'v1.4'
 $ReportScriptName = 'ServerInventoryReport.ps1'
+
+$MonitoredServices = @(
+    'WinRM'
+    'W32Time'
+    'EventLog'
+    'LanmanServer'
+    'LanmanWorkstation'
+    'Spooler'
+    'Dhcp'
+    'Dnscache'
+    'RemoteRegistry'
+    'Schedule'
+    'BITS'
+)
 
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $OutputPath = Join-Path -Path $PSScriptRoot -ChildPath 'reports'
@@ -113,26 +127,67 @@ function Get-DiskHealthStatus {
     }
 }
 
-function Get-ServerHealthStatus {
+function Get-ServiceHealthStatus {
     <#
     .SYNOPSIS
-        Determines overall server health based on disk statuses.
+        Evaluates monitored service health based on status and start type.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [bool]$Found,
+
+        [string]$Status,
+        [string]$StartType
+    )
+
+    if (-not $Found) {
+        return 'Unknown'
+    }
+
+    if ($Status -eq 'Running') {
+        return 'Healthy'
+    }
+
+    $IsAutomatic = $StartType -in @('Automatic', 'Auto', 'AutomaticDelayedStart')
+    $IsManual    = $StartType -in @('Manual', 'ManualTrigger')
+
+    if ($Status -eq 'Stopped' -and $IsAutomatic) {
+        return 'Critical'
+    }
+
+    if ($Status -eq 'Stopped' -and $IsManual) {
+        return 'Warning'
+    }
+
+    return 'Healthy'
+}
+
+function Get-CombinedServerHealthStatus {
+    <#
+    .SYNOPSIS
+        Determines overall server health from disk and service health statuses.
     #>
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [string[]]$DiskStatuses
+        [string[]]$DiskStatuses,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$ServiceHealthStatuses
     )
 
-    if ($DiskStatuses -contains 'Critical') {
+    $AllStatuses = @($DiskStatuses) + @($ServiceHealthStatuses)
+
+    if ($AllStatuses -contains 'Critical') {
         return 'Critical'
     }
-    elseif ($DiskStatuses -contains 'Warning') {
+
+    if ($AllStatuses -contains 'Warning') {
         return 'Warning'
     }
-    else {
-        return 'Healthy'
-    }
+
+    return 'Healthy'
 }
 
 function Get-StatusCssClass {
@@ -146,6 +201,7 @@ function Get-StatusCssClass {
         'Warning'     { return 'status-warning' }
         'Critical'    { return 'status-critical' }
         'Unreachable' { return 'status-unreachable' }
+        'Unknown'     { return 'status-unknown' }
         default       { return '' }
     }
 }
@@ -216,6 +272,96 @@ function Get-RemoteDiskInventory {
         }
 }
 
+function Get-ServiceInventory {
+    <#
+    .SYNOPSIS
+        Collects monitored Windows service inventory for a server.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ServerName,
+
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory)]
+        [bool]$IsLocal,
+
+        [Parameter(Mandatory)]
+        [string[]]$ServiceNames
+    )
+
+    $ServiceInventory = @()
+
+    if ($IsLocal) {
+        foreach ($Name in $ServiceNames) {
+            $Service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+
+            if ($Service) {
+                $ServiceStatus = $Service.Status.ToString()
+                $StartType     = $Service.StartType.ToString()
+
+                $ServiceInventory += [PSCustomObject]@{
+                    ComputerName = $ComputerName
+                    ServiceName  = $Service.Name
+                    DisplayName  = $Service.DisplayName
+                    Status       = $ServiceStatus
+                    StartType    = $StartType
+                    HealthStatus = Get-ServiceHealthStatus -Found $true -Status $ServiceStatus -StartType $StartType
+                }
+            }
+            else {
+                $ServiceInventory += [PSCustomObject]@{
+                    ComputerName = $ComputerName
+                    ServiceName  = $Name
+                    DisplayName  = ''
+                    Status       = 'Not Found'
+                    StartType    = ''
+                    HealthStatus = 'Unknown'
+                }
+            }
+        }
+    }
+    else {
+        $CimServices = @(Get-CimInstance -ClassName Win32_Service -ComputerName $ServerName -ErrorAction Stop |
+            Where-Object { $_.Name -in $ServiceNames })
+
+        foreach ($Name in $ServiceNames) {
+            $Service = $CimServices | Where-Object Name -eq $Name | Select-Object -First 1
+
+            if ($Service) {
+                $ServiceStatus = $Service.State
+                $StartType     = switch ($Service.StartMode) {
+                    'Auto'   { 'Automatic' }
+                    'Manual' { 'Manual' }
+                    default  { $Service.StartMode }
+                }
+
+                $ServiceInventory += [PSCustomObject]@{
+                    ComputerName = $ComputerName
+                    ServiceName  = $Service.Name
+                    DisplayName  = $Service.DisplayName
+                    Status       = $ServiceStatus
+                    StartType    = $StartType
+                    HealthStatus = Get-ServiceHealthStatus -Found $true -Status $ServiceStatus -StartType $StartType
+                }
+            }
+            else {
+                $ServiceInventory += [PSCustomObject]@{
+                    ComputerName = $ComputerName
+                    ServiceName  = $Name
+                    DisplayName  = ''
+                    Status       = 'Not Found'
+                    StartType    = ''
+                    HealthStatus = 'Unknown'
+                }
+            }
+        }
+    }
+
+    return $ServiceInventory
+}
+
 function Get-ServerInventory {
     <#
     .SYNOPSIS
@@ -267,11 +413,20 @@ function Get-ServerInventory {
             $DiskInventory = @(Get-RemoteDiskInventory -ComputerName $ServerName)
         }
 
-        $SystemInventory.ServerStatus = Get-ServerHealthStatus -DiskStatuses @($DiskInventory.Status)
+        $ServiceInventory = @(Get-ServiceInventory `
+            -ServerName $ServerName `
+            -ComputerName $SystemInventory.ComputerName `
+            -IsLocal $IsLocal `
+            -ServiceNames $MonitoredServices)
+
+        $SystemInventory.ServerStatus = Get-CombinedServerHealthStatus `
+            -DiskStatuses @($DiskInventory.Status) `
+            -ServiceHealthStatuses @($ServiceInventory.HealthStatus)
 
         return [PSCustomObject]@{
-            System = $SystemInventory
-            Disks  = $DiskInventory
+            System   = $SystemInventory
+            Disks    = $DiskInventory
+            Services = $ServiceInventory
         }
     }
     catch {
@@ -294,7 +449,8 @@ function Get-ServerInventory {
                 Reachable       = $false
                 ErrorMessage    = $_.Exception.Message
             }
-            Disks = @()
+            Disks    = @()
+            Services = @()
         }
     }
 }
@@ -393,6 +549,49 @@ function Get-HtmlDiskDetailsTable {
 "@
 }
 
+function Get-HtmlServiceDetailsTable {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Services
+    )
+
+    if (-not $Services) {
+        return '<p class="no-data">No service information available.</p>'
+    }
+
+    $HtmlRows = foreach ($Service in $Services) {
+        $StatusClass = Get-StatusCssClass -Status $Service.HealthStatus
+        @"
+        <tr>
+            <td>$($Service.ComputerName)</td>
+            <td>$($Service.ServiceName)</td>
+            <td>$($Service.DisplayName)</td>
+            <td>$($Service.Status)</td>
+            <td>$($Service.StartType)</td>
+            <td><span class="status-badge $StatusClass">$($Service.HealthStatus)</span></td>
+        </tr>
+"@
+    }
+
+    return @"
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Computer</th>
+            <th>Service</th>
+            <th>Display Name</th>
+            <th>Status</th>
+            <th>Start Type</th>
+            <th>Health</th>
+        </tr>
+    </thead>
+    <tbody>
+        $($HtmlRows -join "`n")
+    </tbody>
+</table>
+"@
+}
+
 function Export-InventoryJson {
     <#
     .SYNOPSIS
@@ -415,7 +614,10 @@ function Export-InventoryJson {
         [array]$Servers,
 
         [Parameter(Mandatory)]
-        [array]$Disks
+        [array]$Disks,
+
+        [Parameter(Mandatory)]
+        [array]$Services
     )
 
     $ReachableServers = @($Servers | Where-Object { $_.Reachable })
@@ -432,9 +634,13 @@ function Export-InventoryJson {
             criticalServers = $Summary.CriticalServers
             failedServers   = $Summary.FailedServers
             totalDrives     = $Summary.TotalDrives
-            healthyDrives   = $Summary.HealthyDrives
-            warningDrives   = $Summary.WarningDrives
-            criticalDrives  = $Summary.CriticalDrives
+            healthyDrives    = $Summary.HealthyDrives
+            warningDrives    = $Summary.WarningDrives
+            criticalDrives   = $Summary.CriticalDrives
+            totalServices    = $Summary.TotalServices
+            healthyServices  = $Summary.HealthyServices
+            warningServices  = $Summary.WarningServices
+            criticalServices = $Summary.CriticalServices
         }
         servers = @(
             foreach ($Server in $ReachableServers) {
@@ -466,6 +672,18 @@ function Export-InventoryJson {
                 }
             }
         )
+        services = @(
+            foreach ($Service in $Services) {
+                [ordered]@{
+                    computerName = $Service.ComputerName
+                    serviceName  = $Service.ServiceName
+                    displayName  = $Service.DisplayName
+                    status       = $Service.Status
+                    startType    = $Service.StartType
+                    healthStatus = $Service.HealthStatus
+                }
+            }
+        )
         failedServers = @(
             foreach ($Server in $FailedServers) {
                 [ordered]@{
@@ -478,7 +696,33 @@ function Export-InventoryJson {
         )
     }
 
-    $JsonReport | ConvertTo-Json -Depth 5 | Out-File -FilePath $Path -Encoding UTF8
+    $JsonReport | ConvertTo-Json -Depth 6 | Out-File -FilePath $Path -Encoding UTF8
+}
+
+function Write-ServiceConsoleTable {
+    <#
+    .SYNOPSIS
+        Writes service inventory to the console in a readable table format.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [array]$Services
+    )
+
+    if (-not $Services) {
+        return
+    }
+
+    $Services |
+        Select-Object `
+            @{Name = 'ComputerName'; Expression = { $_.ComputerName } }, `
+            @{Name = 'ServiceName';  Expression = { $_.ServiceName } }, `
+            @{Name = 'Status';       Expression = { $_.Status } }, `
+            @{Name = 'StartType';    Expression = { $_.StartType } }, `
+            @{Name = 'HealthStatus'; Expression = { $_.HealthStatus } } |
+        Format-Table -Property ComputerName, ServiceName, Status, StartType, HealthStatus -AutoSize |
+        Out-String -Width 250 |
+        ForEach-Object { Write-Host $_ }
 }
 
 function Write-DiskConsoleTable {
@@ -637,6 +881,10 @@ function Get-HtmlStyles {
             background-color: #f3f4f6;
             color: #6b7280;
         }
+        .status-unknown {
+            background-color: #ede9fe;
+            color: #5b21b6;
+        }
         .no-data {
             color: #6b7280;
             font-style: italic;
@@ -672,21 +920,26 @@ $InventoryResults = foreach ($ServerName in $ServerNames) {
     Get-ServerInventory -ServerName $ServerName
 }
 
-$AllServers = @($InventoryResults | ForEach-Object { $_.System })
-$AllDisks   = @($InventoryResults | ForEach-Object { $_.Disks })
+$AllServers  = @($InventoryResults | ForEach-Object { $_.System })
+$AllDisks    = @($InventoryResults | ForEach-Object { $_.Disks })
+$AllServices = @($InventoryResults | ForEach-Object { $_.Services })
 
 # Dashboard Summary
 
 $ServerSummary = [PSCustomObject]@{
-    TotalServers    = $AllServers.Count
-    HealthyServers  = @($AllServers | Where-Object ServerStatus -eq 'Healthy').Count
-    WarningServers  = @($AllServers | Where-Object ServerStatus -eq 'Warning').Count
-    CriticalServers = @($AllServers | Where-Object ServerStatus -eq 'Critical').Count
-    FailedServers   = @($AllServers | Where-Object ServerStatus -eq 'Unreachable').Count
-    TotalDrives     = $AllDisks.Count
-    HealthyDrives   = @($AllDisks | Where-Object Status -eq 'Healthy').Count
-    WarningDrives   = @($AllDisks | Where-Object Status -eq 'Warning').Count
-    CriticalDrives  = @($AllDisks | Where-Object Status -eq 'Critical').Count
+    TotalServers     = $AllServers.Count
+    HealthyServers   = @($AllServers | Where-Object ServerStatus -eq 'Healthy').Count
+    WarningServers   = @($AllServers | Where-Object ServerStatus -eq 'Warning').Count
+    CriticalServers  = @($AllServers | Where-Object ServerStatus -eq 'Critical').Count
+    FailedServers    = @($AllServers | Where-Object ServerStatus -eq 'Unreachable').Count
+    TotalDrives      = $AllDisks.Count
+    HealthyDrives    = @($AllDisks | Where-Object Status -eq 'Healthy').Count
+    WarningDrives    = @($AllDisks | Where-Object Status -eq 'Warning').Count
+    CriticalDrives   = @($AllDisks | Where-Object Status -eq 'Critical').Count
+    TotalServices    = $AllServices.Count
+    HealthyServices  = @($AllServices | Where-Object HealthStatus -eq 'Healthy').Count
+    WarningServices  = @($AllServices | Where-Object HealthStatus -eq 'Warning').Count
+    CriticalServices = @($AllServices | Where-Object HealthStatus -eq 'Critical').Count
 }
 
 # Export Reports
@@ -709,11 +962,16 @@ try {
             SerialNumber    = $Server.SerialNumber
             CPUName         = $Server.CPUName
             SystemUptime    = $Server.SystemUptime
+            ServiceName     = ''
+            DisplayName     = ''
+            ServiceStatus   = ''
+            StartType       = ''
             DriveLetter     = ''
             TotalSizeGB     = ''
             FreeSpaceGB     = ''
             FreePercent     = ''
             Status          = $Server.ServerStatus
+            HealthStatus    = ''
         }
     }
 
@@ -732,11 +990,44 @@ try {
             SerialNumber    = ''
             CPUName         = ''
             SystemUptime    = ''
+            ServiceName     = ''
+            DisplayName     = ''
+            ServiceStatus   = ''
+            StartType       = ''
             DriveLetter     = $Disk.DriveLetter
             TotalSizeGB     = $Disk.TotalSizeGB
             FreeSpaceGB     = $Disk.FreeSpaceGB
             FreePercent     = $Disk.FreePercent
             Status          = $Disk.Status
+            HealthStatus    = ''
+        }
+    }
+
+    foreach ($Service in $AllServices) {
+        $CsvExport += [PSCustomObject]@{
+            RecordType      = 'Service'
+            ServerName      = $Service.ComputerName
+            ComputerName    = $Service.ComputerName
+            OperatingSystem = ''
+            OSVersion       = ''
+            Manufacturer    = ''
+            Model           = ''
+            TotalRAMGB      = ''
+            FreeRAMGB       = ''
+            BIOSVersion     = ''
+            SerialNumber    = ''
+            CPUName         = ''
+            SystemUptime    = ''
+            ServiceName     = $Service.ServiceName
+            DisplayName     = $Service.DisplayName
+            ServiceStatus   = $Service.Status
+            StartType       = $Service.StartType
+            DriveLetter     = ''
+            TotalSizeGB     = ''
+            FreeSpaceGB     = ''
+            FreePercent     = ''
+            Status          = $Service.Status
+            HealthStatus    = $Service.HealthStatus
         }
     }
 
@@ -747,8 +1038,9 @@ try {
     $ReportDate      = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $ReportDateShort = Get-Date -Format 'yyyy-MM-dd'
     $CurrentUser     = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $ServerHtml      = Get-HtmlServerStatusTable -Servers $AllServers
-    $DiskHtml        = Get-HtmlDiskDetailsTable -Disks $AllDisks
+    $ServerHtml  = Get-HtmlServerStatusTable -Servers $AllServers
+    $DiskHtml    = Get-HtmlDiskDetailsTable -Disks $AllDisks
+    $ServiceHtml = Get-HtmlServiceDetailsTable -Services $AllServices
 
     $HtmlReport = @"
 <!DOCTYPE html>
@@ -803,11 +1095,36 @@ $(Get-HtmlStyles)
             </div>
         </div>
 
+        <div class="summary-panel">
+            <h2>Service Health Summary</h2>
+            <div class="summary-grid">
+                <div class="summary-card">
+                    <div class="label">Total Services</div>
+                    <div class="value">$($ServerSummary.TotalServices)</div>
+                </div>
+                <div class="summary-card healthy">
+                    <div class="label">Healthy</div>
+                    <div class="value">$($ServerSummary.HealthyServices)</div>
+                </div>
+                <div class="summary-card warning">
+                    <div class="label">Warning</div>
+                    <div class="value">$($ServerSummary.WarningServices)</div>
+                </div>
+                <div class="summary-card critical">
+                    <div class="label">Critical</div>
+                    <div class="value">$($ServerSummary.CriticalServices)</div>
+                </div>
+            </div>
+        </div>
+
         <h2>Server Status</h2>
         $ServerHtml
 
         <h2>Disk Details</h2>
         $DiskHtml
+
+        <h2>Service Inventory</h2>
+        $ServiceHtml
 
         <div class="footer">
             <p><strong>Generated By:</strong> $ReportScriptName</p>
@@ -829,7 +1146,8 @@ $(Get-HtmlStyles)
         -GeneratedBy $ReportScriptName `
         -Summary $ServerSummary `
         -Servers $AllServers `
-        -Disks $AllDisks
+        -Disks $AllDisks `
+        -Services $AllServices
 }
 catch {
     Write-Error "Unable to export inventory reports. $_"
@@ -846,6 +1164,20 @@ Write-Host 'Server Summary'
 Write-Host '--------------'
 $ServerSummary | Format-List
 Write-Host ''
+Write-Host 'Service Summary'
+Write-Host '---------------'
+Write-Host "Healthy Services  : $($ServerSummary.HealthyServices)"
+Write-Host "Warning Services  : $($ServerSummary.WarningServices)"
+Write-Host "Critical Services : $($ServerSummary.CriticalServices)"
+Write-Host ''
+
+$CriticalServices = @($AllServices | Where-Object HealthStatus -eq 'Critical')
+if ($CriticalServices) {
+    Write-Host 'Critical Services Detected'
+    Write-Host '----------------------------'
+    Write-ServiceConsoleTable -Services $CriticalServices
+    Write-Host ''
+}
 
 foreach ($Result in $InventoryResults) {
     $Server = $Result.System
@@ -861,6 +1193,11 @@ foreach ($Result in $InventoryResults) {
         if ($Result.Disks) {
             Write-Host 'Disk Information'
             Write-DiskConsoleTable -Disks $Result.Disks
+        }
+
+        if ($Result.Services) {
+            Write-Host 'Service Information'
+            Write-ServiceConsoleTable -Services $Result.Services
         }
     }
     else {
