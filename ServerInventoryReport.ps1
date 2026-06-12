@@ -5,7 +5,7 @@
     Generates a multi-server inventory report and exports results to CSV, HTML, and JSON.
 
 .DESCRIPTION
-    PowerShell Server Inventory Report v1.6
+    PowerShell Server Inventory Report v1.8
     Reads server names from servers.txt and collects system, hardware, BIOS,
     CPU, uptime, disk, Windows service, installed software, and network
     configuration information from each target. Exports a combined inventory
@@ -59,8 +59,17 @@ param(
 # Variables
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion    = 'v1.6'
+$ScriptVersion    = 'v1.8'
 $ReportScriptName = 'ServerInventoryReport.ps1'
+$LogDirectory     = Join-Path -Path $PSScriptRoot -ChildPath 'logs'
+$ExportsDirectory = Join-Path -Path $PSScriptRoot -ChildPath 'exports'
+$RuntimeDirectory = Join-Path -Path $PSScriptRoot -ChildPath 'runtime'
+$CollectorConfigPath = Join-Path -Path $PSScriptRoot -ChildPath 'config.json'
+$InfraOpsModulePath  = Join-Path -Path $PSScriptRoot -ChildPath 'Submit-InfraOpsInventory.ps1'
+
+if (Test-Path -Path $InfraOpsModulePath) {
+    . $InfraOpsModulePath
+}
 
 $SoftwareRegistryPaths = @(
     'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
@@ -1361,7 +1370,7 @@ function Get-HtmlNetworkDetailsTable {
 "@
 }
 
-function Export-InventoryJson {
+function Write-InventoryReportJson {
     <#
     .SYNOPSIS
         Builds and exports the inventory report as JSON for dashboard integration.
@@ -1410,6 +1419,7 @@ function Export-InventoryJson {
     $JsonReport = [ordered]@{
         reportVersion = $Version
         generatedAt   = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+        sourceType    = 'windows'
         generatedBy   = $GeneratedBy
         serverSummary = [ordered]@{
             totalServers    = $Summary.TotalServers
@@ -1519,6 +1529,8 @@ function Export-InventoryJson {
     }
 
     $JsonReport | ConvertTo-Json -Depth 6 | Out-File -FilePath $Path -Encoding UTF8
+
+    return $JsonReport
 }
 
 function Write-ServiceConsoleTable {
@@ -1734,17 +1746,61 @@ function Get-HtmlStyles {
 '@
 }
 
-# Read Server List
+# Collector Execution
+
+$LockAcquired = $false
+$HeartbeatUpdated = $false
+$CollectorExitCode = 0
 
 try {
-    $ServerNames = Get-ServerList -Path $ServerListFile
-}
-catch {
-    Write-Error $_
-    exit 1
-}
+    if (Get-Command -Name Test-CollectorHealth -ErrorAction SilentlyContinue) {
+        Test-CollectorHealth `
+            -ConfigPath $CollectorConfigPath `
+            -LogDirectory $LogDirectory `
+            -ExportsDirectory $ExportsDirectory `
+            -RuntimeDirectory $RuntimeDirectory | Out-Null
+    }
 
-# Collect Inventory
+    if (Get-Command -Name Test-CollectorLock -ErrorAction SilentlyContinue) {
+        if (Test-CollectorLock -RuntimeDirectory $RuntimeDirectory) {
+            if (Get-Command -Name Write-CollectorLog -ErrorAction SilentlyContinue) {
+                Write-CollectorLog -Message 'ERROR Lock file detected' -Level ERROR -LogDirectory $LogDirectory
+            }
+
+            Write-Host 'Collector already running.'
+            Write-Host 'Skipping execution.'
+            return
+        }
+    }
+
+    if (Get-Command -Name Set-CollectorLock -ErrorAction SilentlyContinue) {
+        Set-CollectorLock -RuntimeDirectory $RuntimeDirectory
+        $LockAcquired = $true
+    }
+
+    if (Get-Command -Name Write-CollectorLog -ErrorAction SilentlyContinue) {
+        Write-CollectorLog -Message 'Collector started' -LogDirectory $LogDirectory
+        Write-CollectorLog -Message 'Schedule execution started' -LogDirectory $LogDirectory
+    }
+
+    # Read Server List
+
+    try {
+        $ServerNames = Get-ServerList -Path $ServerListFile
+    }
+    catch {
+        if (Get-Command -Name Write-CollectorLog -ErrorAction SilentlyContinue) {
+            Write-CollectorLog -Message "ERROR Collector failed: $($_.Exception.Message)" -Level ERROR -LogDirectory $LogDirectory
+        }
+
+        throw
+    }
+
+    if (Get-Command -Name Write-CollectorLog -ErrorAction SilentlyContinue) {
+        Write-CollectorLog -Message 'Inventory collection start' -LogDirectory $LogDirectory
+    }
+
+    # Collect Inventory
 
 $InventoryResults = foreach ($ServerName in $ServerNames) {
     Write-Verbose "Collecting inventory for: $ServerName"
@@ -2157,7 +2213,7 @@ $(Get-HtmlStyles)
 
     # JSON Report
 
-    Export-InventoryJson -Path $JsonPath `
+    $InventoryPayload = Write-InventoryReportJson -Path $JsonPath `
         -Version $ScriptVersion `
         -GeneratedBy $ReportScriptName `
         -Summary $ServerSummary `
@@ -2168,9 +2224,79 @@ $(Get-HtmlStyles)
         -Networks $ExportNetworks `
         -NetworkSummary $NetworkSummary
 }
+    catch {
+        if (Get-Command -Name Write-CollectorLog -ErrorAction SilentlyContinue) {
+            Write-CollectorLog -Message "ERROR Collector failed: $($_.Exception.Message)" -Level ERROR -LogDirectory $LogDirectory
+        }
+
+        throw
+    }
+
+    if (Get-Command -Name Submit-InfraOpsInventory -ErrorAction SilentlyContinue) {
+        try {
+            $UploadResult = Submit-InfraOpsInventory `
+                -InventoryObject $InventoryPayload `
+                -ConfigPath $CollectorConfigPath `
+                -ExportsDirectory $ExportsDirectory `
+                -LogDirectory $LogDirectory
+
+            if ($UploadResult.Success) {
+                if (Get-Command -Name Update-CollectorHeartbeat -ErrorAction SilentlyContinue) {
+                    Update-CollectorHeartbeat -Status 'Success' -RunId $UploadResult.RunId -RuntimeDirectory $RuntimeDirectory
+                    $HeartbeatUpdated = $true
+                }
+            }
+            else {
+                if (Get-Command -Name Update-CollectorHeartbeat -ErrorAction SilentlyContinue) {
+                    Update-CollectorHeartbeat -Status 'Failed' -RuntimeDirectory $RuntimeDirectory
+                    $HeartbeatUpdated = $true
+                }
+            }
+        }
+        catch {
+            if (Get-Command -Name Write-CollectorLog -ErrorAction SilentlyContinue) {
+                Write-CollectorLog -Message $_.Exception.Message -Level ERROR -LogDirectory $LogDirectory
+            }
+
+            if (Get-Command -Name Update-CollectorHeartbeat -ErrorAction SilentlyContinue) {
+                Update-CollectorHeartbeat -Status 'Failed' -RuntimeDirectory $RuntimeDirectory
+                $HeartbeatUpdated = $true
+            }
+
+            Write-Host 'API unavailable.'
+            Write-Host 'Inventory saved locally.'
+        }
+    }
+
+    if ($HeartbeatUpdated -and (Get-Command -Name Write-CollectorLog -ErrorAction SilentlyContinue)) {
+        Write-CollectorLog -Message 'Heartbeat updated' -LogDirectory $LogDirectory
+    }
+}
 catch {
-    Write-Error "Unable to export inventory reports. $_"
-    exit 1
+    if (-not $HeartbeatUpdated -and (Get-Command -Name Update-CollectorHeartbeat -ErrorAction SilentlyContinue)) {
+        Update-CollectorHeartbeat -Status 'Failed' -RuntimeDirectory $RuntimeDirectory
+        $HeartbeatUpdated = $true
+    }
+
+    if (Get-Command -Name Write-CollectorLog -ErrorAction SilentlyContinue) {
+        Write-CollectorLog -Message "ERROR Collector failed: $($_.Exception.Message)" -Level ERROR -LogDirectory $LogDirectory
+    }
+
+    $CollectorExitCode = 1
+    Write-Error $_
+}
+finally {
+    if ($LockAcquired -and (Get-Command -Name Remove-CollectorLock -ErrorAction SilentlyContinue)) {
+        Remove-CollectorLock -RuntimeDirectory $RuntimeDirectory
+    }
+
+    if ($LockAcquired -and (Get-Command -Name Write-CollectorLog -ErrorAction SilentlyContinue)) {
+        Write-CollectorLog -Message 'Collector completed' -LogDirectory $LogDirectory
+    }
+}
+
+if ($CollectorExitCode -ne 0) {
+    exit $CollectorExitCode
 }
 
 # Console Output

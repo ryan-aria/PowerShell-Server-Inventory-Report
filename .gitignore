@@ -18,6 +18,14 @@ reports/*
 !reports/.gitkeep
 reports/*.json
 
+# InfraOps collector output
+logs/*
+!logs/.gitkeep
+exports/*
+!exports/.gitkeep
+runtime/*
+!runtime/.gitkeep
+
 # Screenshots
 screenshots/*
 !screenshots/.gitkeep

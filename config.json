@@ -1,0 +1,10 @@
+{
+  "ApiUrl": "http://localhost:3010/api/import/windows-inventory",
+  "CollectorName": "windows-inventory-collector",
+  "CollectorVersion": "v1.8",
+  "TimeoutSeconds": 30,
+  "Scheduling": {
+    "Enabled": true,
+    "FrequencyHours": 6
+  }
+}
